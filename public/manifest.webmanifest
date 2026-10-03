@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "SAHARA AI — Safer Journeys",
+  "short_name": "SAHARA AI",
+  "description": "Your safety companion, wherever you go.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#fff8fa",
+  "theme_color": "#501536",
+  "icons": [
+    {
+      "src": "/sahara-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
