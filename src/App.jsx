@@ -47,6 +47,8 @@ const navItems = [
   { to: '/home', label: 'Overview', icon: Home },
   { to: '/journey', label: 'Plan a journey', icon: RouteIcon },
   { to: '/live-journey', label: 'Live journey', icon: Navigation },
+  { to: '/safe-watch', label: 'Safe watch', icon: Watch },
+  { to: '/codeword', label: 'Codeword', icon: LockKeyhole },
   { to: '/sos', label: 'Emergency', icon: Siren },
   { to: '/voice', label: 'Sahara assistant', icon: Mic },
   { to: '/nearby-help', label: 'Nearby help', icon: LifeBuoy },
@@ -55,16 +57,20 @@ const navItems = [
   { to: '/guardian', label: 'Guardian view', icon: Users },
   { to: '/notifications', label: 'Notifications', icon: Bell },
   { to: '/history', label: 'Safety history', icon: Clock3 },
+  { to: '/device-loss', label: 'Device loss', icon: Smartphone },
   { to: '/privacy', label: 'Privacy center', icon: LockKeyhole },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 const featureItems = [
   { title: 'On-device safety tools', detail: 'A clear place to check in, get ready, and manage your next step.', icon: Sparkles, to: '/home' },
   { title: 'Journey check-ins', detail: 'Record manual check-ins on this device. Automatic contact alerts are not configured.', icon: Navigation, to: '/journey' },
+  { title: 'SAHARA Safe Watch', detail: 'Review a compatible wearable, device status, battery, and emergency readyness.', icon: Watch, to: '/safe-watch' },
+  { title: 'Codeword & silent alert', detail: 'Use a private codeword and a silent alert flow with explicit permissions.', icon: ShieldAlert, to: '/codeword' },
   { title: 'Your trusted circle', detail: 'Keep contact details here and choose when to call or message them.', icon: Users, to: '/profile' },
   { title: 'Emergency response', detail: 'Open an on-device SOS flow. Emergency-service calls are never placed automatically.', icon: Siren, to: '/sos' },
   { title: 'Battery guardian', detail: 'Know when your phone needs a little extra attention.', icon: BatteryCharging, to: '/battery' },
   { title: 'Voice safety', detail: 'Use browser speech when supported, or enter a command by text.', icon: Mic, to: '/voice' },
+  { title: 'Device loss protocol', detail: 'Prepare a response plan when the phone may be unavailable or taken away.', icon: Smartphone, to: '/device-loss' },
 ];
 const SafetyContext = createContext(null);
 
@@ -202,6 +208,32 @@ function App() {
   const [seenActivityIds, setSeenActivityIds] = useStoredState('sahara-seen-activity', []);
   const [travelledPath, setTravelledPath] = useState([]);
   const [duressPin, setDuressPin] = useState('');
+  const [sessionRevoked, setSessionRevoked] = useStoredState('sahara-session-revoked', false);
+  const [watchStatus, setWatchStatus] = useStoredState('sahara-watch-status', {
+    deviceStatus: 'simulated',
+    battery: 78,
+    signal: '5G',
+    registeredDevice: 'SAHARA Watch X',
+    location: 'Location available on demand',
+    lastUpdated: 'just now',
+    emergencyReady: true,
+    alertsSent: 0,
+  });
+  const [codeword, setCodeword] = useStoredState('sahara-codeword', 'BLOSSOM');
+  const [codewordMessage, setCodewordMessage] = useStoredState('sahara-codeword-message', 'Need help. I am not safe and need a check-in.');
+  const [trustedContact, setTrustedContact] = useStoredState('sahara-codeword-contact', 'Mom');
+  const [codewordHistory, setCodewordHistory] = useStoredState('sahara-codeword-history', [
+    { time: 'Today · 8:35 AM', status: 'Manual silent alert rehearsed · no real emergency contact was sent.' },
+    { time: 'Yesterday · 6:00 PM', status: 'Codeword page configured for a trusted contact.' },
+  ]);
+  const [deviceLossState, setDeviceLossState] = useStoredState('sahara-device-loss', {
+    lastShare: 'No recent GPS fix',
+    lastLocation: 'Location unavailable',
+    altDevice: 'Connected backup phone',
+    trustedContactPriority: 'Mom · primary escalation',
+    accessLocked: true,
+    recoveryReady: 'Recovery steps prepared',
+  });
   const [alertSoundOn, setAlertSoundOn] = useState(false);
   const audioRef = useRef(null);
   const activationTimerRef = useRef(null);
@@ -231,6 +263,19 @@ function App() {
     const id = Date.now();
     setNotifications((items) => [...items, { id, message, kind }]);
     window.setTimeout(() => setNotifications((items) => items.filter((item) => item.id !== id)), 3500);
+  };
+  const appendNotificationEvent = ({ title, contact = 'System', status = 'Event recorded locally', time = new Date().toISOString(), kind = 'safety', simulated = false } = {}) => {
+    const event = {
+      id: `event-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      contact,
+      time,
+      status,
+      kind,
+      simulated,
+    };
+    setNotificationLog((items) => [event, ...items].slice(0, 40));
+    addActivity(title, kind);
   };
   const addActivity = (message, kind = 'info') => {
     setActivity((items) => [{ id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, message, kind, time: new Date().toISOString() }, ...items].slice(0, 100));
@@ -312,6 +357,17 @@ function App() {
     localStorage.removeItem('sahara-onboarding-complete');
     localStorage.removeItem('sahara-settings');
     localStorage.removeItem('sahara-deviation-threshold');
+    localStorage.removeItem('sahara-watch-status');
+    localStorage.removeItem('sahara-codeword');
+    localStorage.removeItem('sahara-codeword-message');
+    localStorage.removeItem('sahara-codeword-contact');
+    localStorage.removeItem('sahara-codeword-history');
+    localStorage.removeItem('sahara-device-loss');
+    localStorage.removeItem('sahara-session-revoked');
+    localStorage.removeItem('sahara-share-location');
+    localStorage.removeItem('sahara-last-known-location');
+    localStorage.removeItem('sahara-demo-mode');
+    localStorage.removeItem('sahara-seen-activity');
     notify(evidenceClearError
       ? `Other local SAHARA data was cleared, but attached evidence could not be cleared: ${evidenceClearError}`
       : 'Local SAHARA data was cleared from this browser. Browser permissions are unchanged.', evidenceClearError ? 'alert' : 'info');
@@ -765,6 +821,9 @@ function App() {
           <Route path="/battery" element={<BatteryPage batteryPct={batteryPct} batteryTimeRemaining={batteryTimeRemaining} batteryStatus={batteryStatus} batteryError={batteryError} location={location} lastKnownLocation={lastKnownLocation} liveLocation={liveLocation} demoMode={demoMode} shareLocation={shareLocation} notify={notify} />} />
           <Route path="/smartwatch" element={<Smartwatch beginEmergencySequence={beginEmergencySequence} journey={journey} batteryPct={batteryPct} recordCheckIn={recordJourneyCheckIn} notify={notify} />} />
           <Route path="/guardian" element={<Guardian profile={profile} journey={journey} batteryPct={batteryPct} location={location} liveLocation={liveLocation} demoMode={demoMode} emergency={emergency} contacts={contacts} notificationLog={notificationLog} backendLocationSharing={backendLocationSharing} />} />
+          <Route path="/safe-watch" element={<SafeWatchPage watchStatus={watchStatus} setWatchStatus={setWatchStatus} notify={notify} onEvent={appendNotificationEvent} />} />
+          <Route path="/codeword" element={<CodewordPage codeword={codeword} setCodeword={setCodeword} codewordMessage={codewordMessage} setCodewordMessage={setCodewordMessage} trustedContact={trustedContact} setTrustedContact={setTrustedContact} contacts={contacts} history={codewordHistory} setHistory={setCodewordHistory} notify={notify} onEvent={appendNotificationEvent} />} />
+          <Route path="/device-loss" element={<DeviceLossProtocol deviceLossState={deviceLossState} setDeviceLossState={setDeviceLossState} setShareLocation={setShareLocation} setDuressPin={setDuressPin} notify={notify} setSessionRevoked={setSessionRevoked} onEvent={appendNotificationEvent} lastKnownLocation={lastKnownLocation} demoMode={demoMode} />} />
           <Route path="/settings" element={<SettingsRoute profile={profile} setProfile={setProfile} contacts={contacts} setContacts={setContacts} shareLocation={shareLocation} setShareLocation={setShareLocation} notify={notify} liveLocation={liveLocation} demoMode={demoMode} requestLocation={requestLocation} setDemoMode={setDemoMode} alertSoundOn={alertSoundOn} startAlertSound={startAlertSound} stopAlertSound={stopAlertSound} duressPin={duressPin} setDuressPin={setDuressPin} />} />
           <Route path="*" element={<Navigate to="/landing" replace />} />
         </Routes>
@@ -2355,5 +2414,197 @@ function SettingsPage({ profile, contacts, shareLocation, setShareLocation, noti
 }
 
 function Modal({ title, children, onClose }) { return <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-heading"><h2 id="modal-title">{title}</h2><button className="icon-button" aria-label="Close" onClick={onClose}><X size={18} /></button></div>{children}</section></div>; }
+
+function SafeWatchPage({ watchStatus, setWatchStatus, notify, onEvent }) {
+  const statusConfig = {
+    simulated: { label: 'SIMULATED', className: 'status-pill status-pill--warning' },
+    connected: { label: 'CONNECTED', className: 'status-pill status-pill--safe' },
+    offline: { label: 'OFFLINE', className: 'status-pill status-pill--danger' },
+  };
+  const activeStatus = statusConfig[watchStatus.deviceStatus] || statusConfig.simulated;
+  const setMode = (mode) => {
+    setWatchStatus((current) => ({ ...current, deviceStatus: mode, lastUpdated: 'just now', emergencyReady: mode !== 'offline' }));
+    if (mode === 'offline') {
+      onEvent?.({ title: 'Safe Watch set offline', contact: 'Wearable', status: 'Connection marked offline. No real hardware alert was sent.', simulated: true });
+      notify('The wearable is offline. No real alert was sent to the device.', 'alert');
+      return;
+    }
+    onEvent?.({ title: mode === 'connected' ? 'Watch connection confirmed' : 'Safe Watch simulator activated', contact: 'Wearable', status: mode === 'connected' ? 'Demo device paired for a local workflow check.' : 'Simulator active. No real hardware connection was established.', simulated: true });
+    notify(mode === 'connected' ? 'Watch connection confirmed for the demo workflow.' : 'The simulator is active and ready for a safe-watch demo.', 'info');
+  };
+  const triggerWatchAlert = () => {
+    setWatchStatus((current) => ({ ...current, alertsSent: current.alertsSent + 1, lastUpdated: 'just now' }));
+    onEvent?.({ title: 'Safe Watch SOS rehearsal', contact: 'Wearable', status: 'Demo alert queued only. No real emergency dispatch was triggered.', simulated: true });
+    notify('Demo SOS queued to the registered wearable. This is a simulator — not a real emergency dispatch.', 'alert');
+  };
+
+  return <div className="page-content">
+    <PageHeader eyebrow="SAHARA SAFE WATCH" title="Wearable backup support" subtitle="Use a device-specific status model when your phone cannot be used. The simulator is explicit about what is real and what is demo only." action={<span className={activeStatus.className}><span />{activeStatus.label}</span>} />
+    <div className="watch-layout">
+      <Panel className="watch-panel">
+        <div className="panel-grid panel-grid--three">
+          <div className="stat-card">
+            <span className="eyebrow">CONNECTION</span>
+            <b>{watchStatus.registeredDevice}</b>
+            <small>{watchStatus.deviceStatus === 'connected' ? 'Paired and ready' : watchStatus.deviceStatus === 'offline' ? 'Waiting for a connection' : 'Simulator ready'}</small>
+          </div>
+          <div className="stat-card">
+            <span className="eyebrow">BATTERY</span>
+            <b>{watchStatus.battery}%</b>
+            <small>{watchStatus.signal} signal</small>
+          </div>
+          <div className="stat-card">
+            <span className="eyebrow">ALERTS</span>
+            <b>{watchStatus.alertsSent}</b>
+            <small>queued in simulator</small>
+          </div>
+        </div>
+        <div className="watch-actions">
+          <button type="button" className="button button--outline" onClick={() => setMode('connected')}>Connect device</button>
+          <button type="button" className="button button--outline" onClick={() => setMode('simulated')}>Use simulator</button>
+          <button type="button" className="button button--dark" onClick={() => setMode('offline')}>Set offline</button>
+          <button type="button" className="button button--hot" onClick={triggerWatchAlert}>Trigger SOS</button>
+        </div>
+      </Panel>
+      <Panel className="watch-detail-panel">
+        <span className="eyebrow">WATCH OVERVIEW</span>
+        <h3>Device status</h3>
+        <ul className="data-list">
+          <li><span>Connection state</span><b>{activeStatus.label}</b></li>
+          <li><span>Last sync</span><b>{watchStatus.lastUpdated}</b></li>
+          <li><span>Location</span><b>{watchStatus.location}</b></li>
+          <li><span>Emergency ready</span><b>{watchStatus.emergencyReady ? 'Yes' : 'No'}</b></li>
+        </ul>
+      </Panel>
+    </div>
+    <div className="watch-help-grid">
+      <Panel>
+        <span className="eyebrow">SETUP INSTRUCTIONS</span>
+        <h3>How this works</h3>
+        <ol className="check-list">
+          <li>Verify the watch supports a compatible companion app or SDK.</li>
+          <li>Register the wearable only after the user confirms the connection.</li>
+          <li>Use the simulator in browser-only demos and never present it as a real broadcast.</li>
+          <li>Keep emergency actions explicit and safe. Confirm whether the device is available before sending an alert.</li>
+        </ol>
+      </Panel>
+      <Panel>
+        <span className="eyebrow">SAFETY NOTES</span>
+        <h3>Important limits</h3>
+        <p className="safety-note">A browser cannot directly command an arbitrary smartwatch. This module demonstrates the flow in a browser-only environment and clearly labels any simulated action.</p>
+      </Panel>
+    </div>
+  </div>;
+}
+
+function CodewordPage({ codeword, setCodeword, codewordMessage, setCodewordMessage, trustedContact, setTrustedContact, contacts, history, setHistory, notify, onEvent }) {
+  const handleSave = (event) => {
+    event.preventDefault();
+    if (!codeword.trim()) {
+      notify('Add a private codeword before saving the silent alert setup.', 'alert');
+      return;
+    }
+    setHistory((current) => [{ time: 'Just now', status: `Codeword updated · ${codeword.trim()}` }, ...current].slice(0, 5));
+    onEvent?.({ title: 'Codeword saved', contact: trustedContact, status: `Private codeword and message saved locally. No microphone, camera, or emergency channel was activated.`, simulated: true });
+    notify('Codeword settings saved locally for this browser session.', 'info');
+  };
+  const triggerSilentAlert = () => {
+    setHistory((current) => [{ time: 'Just now', status: 'Silent alert rehearsal activated · no real emergency service was contacted.' }, ...current].slice(0, 5));
+    onEvent?.({ title: 'Silent alert rehearsal', contact: trustedContact, status: 'Silent alert created in local demo mode. No microphone or camera was activated. No real services were contacted.', simulated: true });
+    notify('Silent alert triggered in the simulator. No real emergency contact or service was sent.', 'alert');
+  };
+  const managedContacts = contacts.length ? contacts : [{ name: 'Mom', phone: '+91 98765 43210' }, { name: 'Sibling', phone: '+91 98111 22222' }];
+
+  return <div className="page-content">
+    <PageHeader eyebrow="CODEWORD & SILENT ALERT" title="Private alert flow" subtitle="Keep the codeword private, user-controlled, and explicit. Silent alert actions are only a local prototype unless the user intentionally confirms a real channel." action={<span className="status-pill status-pill--safe"><span />READY</span>} />
+    <div className="codeword-layout">
+      <Panel className="codeword-panel">
+        <form onSubmit={handleSave} className="codeword-form">
+          <label className="field-label">PRIVATE CODEWORD<input type="text" value={codeword} onChange={(event) => setCodeword(event.target.value)} placeholder="Choose a private codeword" maxLength={18} /></label>
+          <label className="field-label">EMERGENCY MESSAGE<textarea value={codewordMessage} onChange={(event) => setCodewordMessage(event.target.value)} rows={4} placeholder="Need help. I am not safe." /></label>
+          <label className="field-label">TRUSTED CONTACT<select value={trustedContact} onChange={(event) => setTrustedContact(event.target.value)}>
+            {managedContacts.map((contact) => <option key={contact.name} value={contact.name}>{contact.name} · {contact.phone || 'No phone saved'}</option>)}
+          </select></label>
+          <label className="checkbox-row"><input type="checkbox" checked readOnly /> I consent to share location only when explicitly approved.</label>
+          <div className="button-row">
+            <button type="submit" className="button button--hot">Save setup</button>
+            <button type="button" className="button button--outline" onClick={triggerSilentAlert}>Trigger silent alert</button>
+          </div>
+        </form>
+      </Panel>
+      <Panel className="codeword-history-panel">
+        <span className="eyebrow">ALERT HISTORY</span>
+        <h3>Recent activity</h3>
+        <div className="history-list">
+          {history.map((entry, index) => <div key={`${entry.time}-${index}`} className="mini-activity"><b>{entry.time}</b><span>{entry.status}</span></div>)}
+        </div>
+      </Panel>
+    </div>
+  </div>;
+}
+
+function DeviceLossProtocol({ deviceLossState, setDeviceLossState, setShareLocation, setDuressPin, notify, setSessionRevoked, onEvent, lastKnownLocation, demoMode }) {
+  const formatCoordinate = (value, axis) => `${Math.abs(value).toFixed(5)}° ${axis === 'lat' ? (value >= 0 ? 'N' : 'S') : (value >= 0 ? 'E' : 'W')}`;
+  const formatLocation = (position) => {
+    if (!position) return 'Location unavailable';
+    const latitude = position.latitude ?? position[0];
+    const longitude = position.longitude ?? position[1];
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return 'Location unavailable';
+    return `${formatCoordinate(latitude, 'lat')}, ${formatCoordinate(longitude, 'lng')}`;
+  };
+  const locationIsFresh = !!lastKnownLocation && !demoMode && Date.now() - lastKnownLocation.timestamp < 5 * 60 * 1000;
+  const renderedLocation = formatLocation(lastKnownLocation || deviceLossState.lastLocation);
+  const lastShareLabel = lastKnownLocation
+    ? `${Math.max(1, Math.round((Date.now() - lastKnownLocation.timestamp) / 60000))} minutes ago`
+    : deviceLossState.lastShare || 'No recent GPS fix';
+  const handleMarkMissing = () => {
+    const locationSummary = formatLocation(lastKnownLocation);
+    setDeviceLossState((current) => ({
+      ...current,
+      accessLocked: true,
+      recoveryReady: 'Recovery guidance prepared',
+      lastLocation: locationSummary,
+      lastShare: locationIsFresh ? 'Just now' : 'Stale fix — needs a new GPS permission check',
+    }));
+    onEvent?.({ title: 'Device loss plan prepared', contact: 'Recovery flow', status: 'Last secured location and recovery steps recorded locally. No automatic detection or emergency service was triggered.', simulated: true });
+    notify('Device-loss plan updated. The app will keep actions explicit and user-approved only.', 'info');
+  };
+  const handleRevokeAccess = () => {
+    setSessionRevoked(true);
+    setShareLocation(false);
+    setDuressPin('');
+    setDeviceLossState((current) => ({ ...current, accessLocked: true, recoveryReady: 'Session revocation prepared', lastShare: 'Session revoked locally', lastLocation: renderedLocation }));
+    onEvent?.({ title: 'Session revoked', contact: 'Trusted devices', status: 'Local session state and location sharing were revoked. No external auth session was modified in this browser-only prototype.', simulated: true });
+    notify('Session revocation and recovery guidance were prepared locally. No unauthorized contact changes were made.', 'alert');
+  };
+
+  return <div className="page-content">
+    <PageHeader eyebrow="DEVICE LOSS PROTOCOL" title="Prepare for an unavailable phone" subtitle="When a phone may be unavailable or taken away, protect access and document the last safe state without guessing about a theft." action={<span className="status-pill status-pill--warning"><span />PREPARED</span>} />
+    <div className="protocol-layout">
+      <Panel>
+        <span className="eyebrow">CURRENT STATUS</span>
+        <div className="protocol-grid">
+          <div className="stat-card"><span className="eyebrow">LAST SHARED LOCATION</span><b>{renderedLocation}</b><small>{!lastKnownLocation ? 'No recent GPS fix available' : locationIsFresh ? `Shared ${lastShareLabel}` : `Stale fix · ${lastShareLabel}`}</small></div>
+          <div className="stat-card"><span className="eyebrow">ALTERNATIVE DEVICE</span><b>{deviceLossState.altDevice}</b><small>Ready to receive a verification link</small></div>
+          <div className="stat-card"><span className="eyebrow">ESCALATION</span><b>{deviceLossState.trustedContactPriority}</b><small>Only verified contacts are listed</small></div>
+          <div className="stat-card"><span className="eyebrow">RECOVERY</span><b>{deviceLossState.recoveryReady}</b><small>{deviceLossState.accessLocked ? 'Access is locked' : 'Access remains open'}</small></div>
+        </div>
+        <div className="watch-actions">
+          <button type="button" className="button button--hot" onClick={handleMarkMissing}>Mark device missing</button>
+          <button type="button" className="button button--outline" onClick={handleRevokeAccess}>Revoke session</button>
+        </div>
+      </Panel>
+      <Panel>
+        <span className="eyebrow">SECURITY GUIDANCE</span>
+        <ul className="check-list">
+          <li>Require appropriate authentication before changing trusted contacts or recovery settings.</li>
+          <li>Only notify a contact if a compatible channel is actually available.</li>
+          <li>Do not claim the app can detect every theft without explicit device signals.</li>
+          <li>Display the age and accuracy of the last location and avoid labeling stale data as current.</li>
+        </ul>
+      </Panel>
+    </div>
+  </div>;
+}
 
 export default App;
