@@ -46,6 +46,12 @@ function clearAccessToken() {
   }
 }
 
+function notifySessionExpired() {
+  if (typeof globalThis.window !== 'undefined') {
+    globalThis.window.dispatchEvent(new Event('sahara:auth-expired'));
+  }
+}
+
 async function request(path, { method = 'GET', body, authenticated = true } = {}) {
   if (!apiBase) return { synced: false, status: 'not-configured' };
   if (!isAllowedApiBaseUrl(apiBase, Boolean(environment.DEV))) {
@@ -69,12 +75,17 @@ async function request(path, { method = 'GET', body, authenticated = true } = {}
     const response = await fetch(`${apiBase}${path}`, {
       method,
       headers,
+      cache: 'no-store',
+      credentials: 'omit',
       ...(body === undefined ? {} : { body: isMultipart ? body : JSON.stringify(body) }),
     });
     const contentType = response.headers.get('content-type') || '';
     const responseBody = contentType.includes('application/json') ? await response.json() : null;
     if (!response.ok) {
-      if (response.status === 401) clearAccessToken();
+      if (response.status === 401) {
+        clearAccessToken();
+        if (authenticated) notifySessionExpired();
+      }
       const message = responseBody?.message
         || responseBody?.detail?.message
         || `Backend request failed (${response.status}).`;
@@ -120,6 +131,16 @@ export async function logoutBackendAccount() {
   const result = await request('/api/auth/logout', { method: 'POST' });
   clearAccessToken();
   return result;
+}
+
+export async function revokeAllBackendSessions() {
+  const result = await request('/api/auth/logout-all', { method: 'POST' });
+  clearAccessToken();
+  return result;
+}
+
+export function loadBackendCurrentUser() {
+  return request('/api/auth/me');
 }
 
 export function toBackendProfile(profile) {
@@ -315,4 +336,80 @@ export function submitCommunityReport(report) {
   const payload = toBackendCommunityReport(report);
   if (!payload) return Promise.resolve({ synced: false, status: 'unsupported-report' });
   return request('/api/community/reports', { method: 'POST', body: payload });
+}
+
+export function listBackendNotifications() {
+  return request('/api/notifications');
+}
+
+export function markBackendNotificationRead(notificationId) {
+  return request(`/api/notifications/${encodeURIComponent(notificationId)}/read`, { method: 'POST' });
+}
+
+export function updateBackendBatteryStatus(batteryPercentage, timestamp = new Date().toISOString()) {
+  return request('/api/battery/update', {
+    method: 'POST',
+    body: { battery_percentage: batteryPercentage, timestamp },
+  });
+}
+
+export function listBackendEvidence() {
+  return request('/api/evidence');
+}
+
+export function uploadBackendEvidence({ type, file, description }) {
+  const body = new FormData();
+  body.append('type', type);
+  if (file) body.append('file', file, file.name || 'evidence');
+  if (description) body.append('description', description);
+  return request('/api/evidence/upload', { method: 'POST', body });
+}
+
+export function deleteBackendEvidence(evidenceId) {
+  return request(`/api/evidence/${encodeURIComponent(evidenceId)}`, { method: 'DELETE' });
+}
+
+export async function downloadBackendEvidence(evidenceId, fallbackFilename = 'sahara-evidence') {
+  if (!apiBase) return { synced: false, status: 'not-configured' };
+  if (!isAllowedApiBaseUrl(apiBase, Boolean(environment.DEV))) {
+    return {
+      synced: false,
+      status: 'invalid-configuration',
+      error: 'The backend API URL must use HTTPS outside local development.',
+    };
+  }
+  const token = readAccessToken();
+  if (!token) return { synced: false, status: 'not-authenticated' };
+
+  try {
+    const response = await fetch(`${apiBase}/api/evidence/${encodeURIComponent(evidenceId)}/download`, {
+      headers: { Authorization: 'Bearer ' + token },
+      cache: 'no-store',
+      credentials: 'omit',
+    });
+    if (!response.ok) {
+      if (response.status === 401) {
+        clearAccessToken();
+        notifySessionExpired();
+      }
+      const contentType = response.headers.get('content-type') || '';
+      const errorBody = contentType.includes('application/json') ? await response.json() : null;
+      return {
+        synced: false,
+        status: response.status === 401 ? 'not-authenticated' : 'unavailable',
+        error: errorBody?.message || errorBody?.detail?.message || `Backend request failed (${response.status}).`,
+      };
+    }
+    const disposition = response.headers.get('content-disposition') || '';
+    const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1]?.replace(/[\\/]/g, '_')
+      || fallbackFilename.replace(/[\\/]/g, '_')
+      || 'sahara-evidence';
+    return { synced: true, status: 'accepted', data: { blob: await response.blob(), filename } };
+  } catch (error) {
+    return {
+      synced: false,
+      status: 'unavailable',
+      error: error instanceof Error ? error.message : 'Unknown API error',
+    };
+  }
 }

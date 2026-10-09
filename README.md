@@ -847,7 +847,7 @@ This separation allows the frontend and backend to be developed independently wh
 
 The frontend uses `VITE_API_URL` as its single backend base URL. In local Vite development it defaults to `http://127.0.0.1:8000`; set `VITE_API_URL` in the frontend deployment environment to the actual FastAPI URL before building for production. Do not put `DATABASE_URL`, `SECRET_KEY`, or Supabase service-role credentials in frontend variables.
 
-Backend account sign-in and record synchronization are optional. Profile, trusted contacts (with a phone number), community reports, journeys, location updates, check-ins, and SOS records sync only after signing into the existing FastAPI account. Without a signed-in account, the existing browser-local experience remains available. Recording an SOS does not send SMS, place calls, or contact emergency services.
+Profile, trusted contacts (with a phone number), community reports, journeys, location updates, check-ins, and SOS records can sync after signing into the existing FastAPI account. App feature routes now require a backend-verified session; the landing page and onboarding remain public. Recording an SOS does not send SMS, place calls, or contact emergency services. GPS permission is requested only after an explicit location or journey action.
 
 ---
 
@@ -1075,3 +1075,66 @@ Sahara AI is built with one simple belief:
 **Deeksha Jaiswal — Backend**
 
 ### 🚀 Hackathon Project • 2026
+
+---
+
+# 🔐 Local Development, Authentication & PWA
+
+## Frontend and backend
+
+The frontend reads its API origin from `VITE_API_URL`. Copy `.env.example` to `.env.local` and retain the local development value:
+
+```env
+VITE_API_URL=http://127.0.0.1:8000
+```
+
+Run the FastAPI backend from the `backend` directory after creating its `.env` from `backend/.env.example`:
+
+```bash
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Run the frontend from the repository root:
+
+```bash
+npm install
+npm run dev
+```
+
+The backend contract currently uses bearer JWTs: `POST /api/auth/signup` and `POST /api/auth/login` return `data.access_token` and `data.user`; `GET /api/auth/me` restores and verifies a tab session; `POST /api/auth/logout` revokes the current session; and `POST /api/auth/logout-all` revokes every session. The backend does not currently issue an HttpOnly authentication cookie or a refresh token. The browser therefore keeps the access token in `sessionStorage` (not `localStorage`), sends it only in an Authorization header, and asks the backend to validate it on app startup. Browser storage is still accessible to same-origin scripts and is not a substitute for HttpOnly cookies or protection against XSS.
+
+The authenticated app routes require a backend-verified session. Landing and onboarding remain public. Account/profile and trusted-contact details, journeys, location updates, SOS records, backend notifications, and the battery reading sync action use existing authenticated endpoints. Battery sync requires an explicit action and omits coordinates. Evidence stays local unless the user explicitly uploads an item; backend upload/download/delete use the authenticated evidence endpoints and omit GPS coordinates. SOS persistence is not the same as contacting emergency services: the backend does not send SMS or place calls. Browser background execution is not reliable for continuous location tracking.
+
+## PWA verification and installation
+
+The web manifest uses the existing Sahara shield artwork in 192×192 and 512×512 SVG assets. In production builds, the service worker caches only the app shell and static Vite assets. It explicitly bypasses `/api/` and does not cache arbitrary same-origin GET responses, authentication data, SOS responses, or location API data. Offline mode can display the cached app shell, but it does not queue or claim delivery of safety requests.
+
+Build and serve the production bundle locally to exercise service-worker registration and browser installability:
+
+```bash
+npm test
+npm run build
+npm run preview
+```
+
+Use `http://localhost` or HTTPS for service-worker/install support. In a supported Chromium browser, use the install prompt when it appears. On iOS Safari, use **Share → Add to Home Screen**; iOS does not expose the same `beforeinstallprompt` event.
+
+## Deployment configuration
+
+Set the frontend build variable to the deployed backend's HTTPS origin:
+
+```env
+VITE_API_URL=https://api.example.com
+```
+
+Replace the example host with the real API origin. Do not use `http://127.0.0.1:8000` in a deployed website: `127.0.0.1` would refer to each visitor's own device. `VITE_` variables are bundled into public frontend code and must never contain secrets.
+
+Configure the FastAPI environment variable `FRONTEND_URL` to the exact deployed frontend origin (scheme and host, with no path), for example:
+
+```env
+FRONTEND_URL=https://sahara.example.com
+```
+
+For multiple allowed frontend origins, separate exact origins with commas. The backend already enables CORS for configured `FRONTEND_URL` values and permits the Authorization and Content-Type headers. Configure the production origin before deploying; do not use a wildcard origin for authenticated requests. Set a strong backend `SECRET_KEY` and a durable production database separately from the frontend.
+
+PWA installability and live API use require HTTPS in production. The service worker provides an offline shell only; it cannot guarantee background journey tracking, SOS delivery, or contact notification when the browser is closed or the device is offline.
