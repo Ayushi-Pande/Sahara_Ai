@@ -1,11 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from datetime import timedelta
+
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, settings
 from app.models import User, UserSession, utcnow
 from app.schemas import LoginInput, SignupInput
-from app.utils.auth import create_access_token, current_user, hash_password, verify_password
+from app.utils.auth import create_access_token, current_user, hash_password, oauth2_scheme, verify_password
 from app.utils.rate_limit import rate_limit
 from app.utils.responses import fail, success
 
@@ -13,14 +15,15 @@ router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 
 def create_session(db: Session, user: User, token: str | None = None):
+    issued_token = token or create_access_token(user.id)
     session = UserSession(
         user_id=user.id,
-        session_token=(token or user.email),
+        session_token=issued_token,
         user_agent="",
         ip_address="",
         created_at=utcnow(),
         last_seen_at=utcnow(),
-        expires_at=utcnow(),
+        expires_at=utcnow() + timedelta(minutes=settings.access_token_minutes),
     )
     db.add(session)
     db.flush()
@@ -79,11 +82,10 @@ def delete_session(session_id: int, db: Session = Depends(get_db), user: User = 
 
 
 @router.post("/logout", summary="Log out the current device")
-def logout_current(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    sessions = db.scalars(select(UserSession).where(UserSession.user_id == user.id).order_by(UserSession.created_at.desc())).all()
-    if sessions:
-        for session in sessions:
-            session.revoked_at = utcnow()
+def logout_current(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    session = db.scalar(select(UserSession).where(UserSession.user_id == user.id, UserSession.session_token == token))
+    if session is not None and session.revoked_at is None:
+        session.revoked_at = utcnow()
         db.commit()
     return success({"logged_out": True})
 

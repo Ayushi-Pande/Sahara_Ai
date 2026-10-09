@@ -27,17 +27,34 @@ Copy `.env.example` to `.env` and set a long random `SECRET_KEY` before any non-
 | --- | --- | --- |
 | `DATABASE_URL` | SQLAlchemy database URL | `sqlite:///./sahara.db` |
 | `SECRET_KEY` | JWT signing secret | Development placeholder; replace it |
-| `FRONTEND_URL` | Allowed browser origin for CORS | `http://localhost:5173` |
+| `FRONTEND_URL` | Comma-separated allowed browser origins | `http://localhost:5173,http://127.0.0.1:5173` |
 | `ACCESS_TOKEN_MINUTES` | JWT lifetime | `60` |
 | `ROUTE_DEVIATION_METERS` | Prototype movement threshold | `500` |
 | `MAX_UPLOAD_MB` | Evidence upload limit | `15` |
 | `DEMO_MODE` | Indicates prototype mode | `true` |
 
-CORS permits only the configured frontend origin. Set `FRONTEND_URL` to the deployed frontend origin; do not use `*` with credentials.
+CORS permits the comma-separated origins in `FRONTEND_URL` (one origin by default). For deployment, set this to the exact frontend origin(s), for example `https://app.example.com`; do not use `*` with credentials.
+
+SQLite is the selected database for the hackathon build. Keep `DATABASE_URL=sqlite:///./sahara.db` and start the service from this `backend` directory. Startup checks the database and creates only missing SQLite tables; it does not drop or reset existing tables. PostgreSQL/Supabase connectivity, Supabase Auth, and Supabase Storage are not part of this setup. Authentication remains application-managed and evidence files are stored locally.
+
+`/health` and `/api/system/status` probe the configured database with `SELECT 1`. A successful health response verifies only that database connection; it does not prove Supabase Auth, Storage, Realtime, or emergency delivery.
+
+### Optional PostgreSQL connectivity test
+
+The normal backend test suite uses isolated temporary SQLite databases. The repository also contains a strictly opt-in PostgreSQL connectivity probe for a dedicated test database. It is not required for local use and does not configure the application to use Supabase. Set `TEST_POSTGRESQL_DATABASE_URL` only if you intentionally want to run that read-only probe:
+
+```powershell
+$env:TEST_POSTGRESQL_DATABASE_URL = "postgresql://<test-user>:<password>@<test-host>/<test-database>"
+..\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The optional test performs only `SELECT 1`; it does not create tables or modify data. If the variable is unset, the test is skipped. No real PostgreSQL or Supabase connection is claimed unless this test is run successfully against your own configured service.
 
 ## Database and demo data
 
-Tables are created when the app starts. SQLite stores data in `sahara.db` relative to the working directory. Seed sample help locations, journey, battery, and accounts with:
+SQLite stores `sahara.db` relative to the working directory. Do not run Alembic migrations as part of the hackathon demo. The existing Render Blueprint keeps its current start command and health check; because its filesystem is not configured here as persistent storage, SQLite data on a hosted instance must not be treated as durable across restarts. Configure a supported persistent volume before relying on hosted SQLite data.
+
+Seed sample help locations, journey, battery, and accounts with:
 
 ```powershell
 python seed.py
@@ -52,6 +69,8 @@ From `backend/`:
 ```powershell
 uvicorn app.main:app --reload
 ```
+
+Render starts the service with `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Configure `FRONTEND_URL` with the exact deployed frontend origin. The current Render template does not configure a persistent SQLite disk, so hosted data durability remains a deployment setup item.
 
 Interactive API docs are at <http://127.0.0.1:8000/docs>; health check is <http://127.0.0.1:8000/health>.
 

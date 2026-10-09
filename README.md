@@ -843,6 +843,12 @@ React UI
 
 This separation allows the frontend and backend to be developed independently while remaining integrated through APIs.
 
+### Backend API configuration
+
+The frontend uses `VITE_API_URL` as its single backend base URL. In local Vite development it defaults to `http://127.0.0.1:8000`; set `VITE_API_URL` in the frontend deployment environment to the actual FastAPI URL before building for production. Do not put `DATABASE_URL`, `SECRET_KEY`, or Supabase service-role credentials in frontend variables.
+
+Backend account sign-in and record synchronization are optional. Profile, trusted contacts (with a phone number), community reports, journeys, location updates, check-ins, and SOS records sync only after signing into the existing FastAPI account. Without a signed-in account, the existing browser-local experience remains available. Recording an SOS does not send SMS, place calls, or contact emergency services.
+
 ---
 
 # 🧪 Testing

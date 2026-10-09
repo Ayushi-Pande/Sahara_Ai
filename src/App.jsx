@@ -4,12 +4,31 @@ import {
   Activity, AlertTriangle, ArrowDownLeft, ArrowLeft, ArrowRight, Battery, BatteryCharging,
   Bell, BookOpen, Check, CheckCircle2, ChevronRight, CircleHelp, Clock3, Compass, Crosshair,
   FileAudio2, FileImage, FileText, FileVideo2, Heart, Home, LifeBuoy, LockKeyhole, Map,
-  MapPin, Menu, MessageCircle, Mic, Navigation, Phone, Plus, Route as RouteIcon, Settings,
+  MapPin, Menu, MessageCircle, Mic, Navigation, Pencil, Phone, Plus, Route as RouteIcon, Settings,
   Shield, ShieldAlert, ShieldCheck, Siren, Smartphone, Sparkles, Users, Volume2, Watch,
   X, Zap,
 } from 'lucide-react';
 import { Circle, CircleMarker, MapContainer, Polyline, TileLayer, Tooltip, useMap } from 'react-leaflet';
-import { saveProfile, sendEmergencyAlert, sendSafetyEvent, submitCommunityReport } from './services/safetyApi.js';
+import {
+  authenticateBackendAccount,
+  checkJourneyRoute,
+  createTrustedContact,
+  deleteTrustedContact,
+  fromBackendProfile,
+  isBackendAuthenticated,
+  listCommunityReports,
+  listTrustedContacts,
+  loadBackendProfile,
+  logoutBackendAccount,
+  saveProfile,
+  sendEmergencyAlert,
+  sendJourneyLocation,
+  sendSafetyEvent,
+  submitCommunityReport,
+  submitJourneyCheckIn,
+  updateJourneyArrival,
+  updateTrustedContact,
+} from './services/safetyApi.js';
 import { clearEvidenceFiles, getEvidenceFile, removeEvidenceFile, saveEvidenceFiles } from './services/evidenceStore.js';
 import useLiveLocation from './hooks/useLiveLocation.js';
 import FunctionalSosPage from './components/FunctionalSosPage.jsx';
@@ -175,6 +194,7 @@ function App() {
   const [batteryError, setBatteryError] = useState('');
   const [demoMode, setDemoMode] = useStoredState('sahara-demo-mode', false);
   const [shareLocation, setShareLocation] = useStoredState('sahara-share-location', false);
+  const [backendLocationSharing, setBackendLocationSharing] = useStoredState('sahara-backend-location-sharing', false);
   const [countdown, setCountdown] = useState(30);
   const [activationCountdown, setActivationCountdown] = useState(null);
   const [notificationLog, setNotificationLog] = useStoredState('sahara-notification-log', []);
@@ -185,6 +205,7 @@ function App() {
   const [alertSoundOn, setAlertSoundOn] = useState(false);
   const audioRef = useRef(null);
   const activationTimerRef = useRef(null);
+  const sosRequestInFlightRef = useRef(false);
   const arrivalReminderForRef = useRef(null);
   const batteryAlertTierRef = useRef(0);
   const liveLocation = useLiveLocation(!demoMode);
@@ -259,6 +280,13 @@ function App() {
     } catch (error) {
       evidenceClearError = error instanceof Error ? error.message : 'Unknown local evidence storage error';
     }
+    if (isBackendAuthenticated()) {
+      const logout = await logoutBackendAccount();
+      if (!logout.synced) {
+        evidenceClearError = [evidenceClearError, 'The backend session could not be confirmed logged out.']
+          .filter(Boolean).join(' ');
+      }
+    }
     stopAlertSound();
     window.clearTimeout(activationTimerRef.current);
     activationTimerRef.current = null;
@@ -278,6 +306,7 @@ function App() {
     setDuressPin('');
     setTravelledPath([]);
     setShareLocation(false);
+    setBackendLocationSharing(false);
     setDemoMode(false);
     setOnboardingComplete(false);
     localStorage.removeItem('sahara-onboarding-complete');
@@ -315,10 +344,18 @@ function App() {
       notify('Demo journey started locally; no sample coordinates were sent to a backend.', 'info');
     } else {
       void sendSafetyEvent('journey-started', { journey: nextJourney }).then((result) => {
-        if (result.synced) return;
+        if (result.synced) {
+          setJourney((current) => current.startedAt === nextJourney.startedAt
+            ? { ...current, backendJourneyId: result.data.backendJourneyId }
+            : current);
+          notify('Journey also recorded by the backend; emergency contact delivery is not enabled.', 'info');
+          return;
+        }
         notify(result.status === 'not-configured'
-          ? 'Journey is active on this device; backend sync is not configured.'
-          : `Journey is active on this device; backend sync failed${result.error ? `: ${result.error}` : '.'}`, 'info');
+          ? 'Journey is active on this device; backend URL is not configured.'
+          : result.status === 'not-authenticated'
+            ? 'Journey is active on this device; sign in to sync it with the backend.'
+            : `Journey is active on this device; backend sync failed${result.error ? `: ${result.error}` : '.'}`, 'info');
       });
     }
     addActivity(`Journey started · ${nextJourney.to}`, 'journey');
@@ -329,19 +366,30 @@ function App() {
     setJourney((current) => ({ ...current, lastCheckInAt: checkedInAt, pendingCheckInAt: null }));
     addActivity('Journey check-in recorded on this device', 'checkin');
     notify('Check-in recorded on this device.');
+    if (journey.backendJourneyId && isBackendAuthenticated()) {
+      void submitJourneyCheckIn(journey.backendJourneyId).then((result) => {
+        if (!result.synced) notify('Check-in remains on this device; backend sync failed.', 'alert');
+      });
+    }
   };
   const extendJourneyArrival = () => {
     const currentArrival = journey.expectedArrivalAt ? new Date(journey.expectedArrivalAt).getTime() : Date.now();
     const nextArrival = new Date(Math.max(Date.now(), currentArrival) + 15 * 60000);
     const nextEta = nextArrival.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     arrivalReminderForRef.current = null;
-    setJourney((current) => ({
-      ...current,
+    const updatedJourney = {
+      ...journey,
       eta: nextEta,
       expectedArrivalAt: nextArrival.toISOString(),
       arrivalReminderAt: null,
       pendingCheckInAt: null,
-    }));
+    };
+    setJourney(updatedJourney);
+    if (journey.backendJourneyId && isBackendAuthenticated()) {
+      void updateJourneyArrival(journey.backendJourneyId, updatedJourney).then((result) => {
+        if (!result.synced) notify('Arrival time updated on this device; backend update failed.', 'alert');
+      });
+    }
     addActivity('Expected arrival extended by 15 minutes', 'journey');
     notify('Expected arrival extended by 15 minutes on this device.');
   };
@@ -351,16 +399,24 @@ function App() {
     stopAlertSound();
     addActivity('Journey monitoring ended on this device', 'journey');
     notify('Journey monitoring ended on this device. This does not confirm arrival.');
-    if (!demoMode) {
+    if (completedJourney.backendJourneyId && isBackendAuthenticated()) {
       void sendSafetyEvent('journey-ended', { journey: completedJourney }).then((result) => {
         if (result.synced) return;
         notify(result.status === 'not-configured'
-          ? 'Journey end is saved locally; backend sync is not configured.'
-          : `Journey end is saved locally; backend sync failed${result.error ? `: ${result.error}` : '.'}`, 'info');
+          ? 'Journey ended on this device; backend URL is not configured.'
+          : result.status === 'not-authenticated'
+            ? 'Journey ended on this device; sign in to sync it with the backend.'
+            : `Journey end is saved locally; backend sync failed${result.error ? `: ${result.error}` : '.'}`, 'info');
       });
+    } else if (!completedJourney.demoModeAtStart) {
+      notify(isBackendAuthenticated()
+        ? 'Journey ended on this device; it was not started as a backend journey.'
+        : 'Journey ended on this device; sign in to sync journeys with the backend.', 'info');
     }
   };
   const activateEmergency = () => {
+    if (emergency || sosRequestInFlightRef.current) return;
+    sosRequestInFlightRef.current = true;
     setEmergency(true);
     const triggeredAt = new Date().toISOString();
     const eventId = `sos-${Date.now()}`;
@@ -387,9 +443,10 @@ function App() {
         ? { ...item, status: demoStatus }
         : item));
       notify(demoStatus, 'alert');
+      sosRequestInFlightRef.current = false;
       return;
     }
-    notify('Emergency mode activated on this device. Checking the configured safety service; contact delivery is unconfirmed.', 'alert');
+    notify('Emergency mode activated on this device. Checking the backend; contact delivery is unconfirmed.', 'alert');
     const currentCoordinates = !demoMode && hasRecentLiveFix(location, liveLocation)
       ? [location.latitude, location.longitude]
       : null;
@@ -400,9 +457,11 @@ function App() {
           : null
         : null;
       const contactStatus = result.synced
-        ? 'SOS accepted by backend; contact delivery is unconfirmed.'
+        ? 'SOS recorded by backend; contact delivery is unconfirmed.'
         : result.status === 'not-configured'
           ? 'Prototype — service not connected. No contact alerts were sent.'
+          : result.status === 'not-authenticated'
+            ? 'SOS is active on this device; sign in to record it with the backend. No contact alerts were sent.'
           : `Prototype — safety service unavailable; no contact alerts were confirmed${result.error ? ` (${result.error})` : ''}.`;
       const updatedContacts = contacts.map((contact) => {
         const response = details?.find((entry) => entry.contact === contact.name || entry.phone === contact.phone);
@@ -416,10 +475,18 @@ function App() {
         };
       });
       setNotificationLog((items) => [
-        { ...eventRecord, status: result.synced ? 'SOS accepted by backend.' : contactStatus },
+        { ...eventRecord, status: result.synced ? 'SOS recorded by backend; delivery unconfirmed.' : contactStatus },
         ...updatedContacts,
         ...items.filter((item) => item.id !== eventId && !contactEvents.some((contact) => contact.id === item.id)),
       ]);
+    }).catch((error) => {
+      const status = `SOS remains active on this device; backend recording was not confirmed${error instanceof Error ? `: ${error.message}` : '.'}`;
+      setNotificationLog((items) => items.map((item) => item.id === eventId || contactEvents.some((contact) => contact.id === item.id)
+        ? { ...item, status }
+        : item));
+      notify(status, 'alert');
+    }).finally(() => {
+      sosRequestInFlightRef.current = false;
     });
   };
   const resolveEmergency = () => {
@@ -554,6 +621,32 @@ function App() {
     addActivity(`GPS location updated · ±${Math.round(location.accuracy)} m`, 'location');
   }, [location?.timestamp, demoMode, journey.active, liveLocation.status]);
   useEffect(() => {
+    const journeyId = journey.backendJourneyId;
+    if (demoMode || !backendLocationSharing || !journey.active || !journeyId || !isBackendAuthenticated()
+      || !hasRecentLiveFix(location, liveLocation)) return undefined;
+    let active = true;
+    const syncLocation = async () => {
+      const route = await checkJourneyRoute(journeyId, location);
+      if (!active) return;
+      if (!route.synced) {
+        notify('Live location remains on this device; backend route check failed.', 'alert');
+        return;
+      }
+      if (route.data?.deviation) {
+        notify('The backend recorded a route-deviation warning; no contacts were alerted.', 'alert');
+      }
+      const result = await sendJourneyLocation(journeyId, {
+        ...location,
+        battery: batteryPct,
+      });
+      if (active && !result.synced) {
+        notify('Live location remains on this device; backend location sync failed.', 'alert');
+      }
+    };
+    void syncLocation();
+    return () => { active = false; };
+  }, [location?.timestamp, journey.backendJourneyId, journey.active, demoMode, backendLocationSharing, liveLocation.status]);
+  useEffect(() => {
     if (!demoMode && liveLocation.position) setLastKnownLocation(liveLocation.position);
   }, [demoMode, liveLocation.position?.timestamp]);
   useEffect(() => () => {
@@ -623,15 +716,17 @@ function App() {
     }
   };
   const addReport = (report) => {
-    setReports((current) => [{ id: Date.now(), ...report, time: new Date().toLocaleString() }, ...current]);
+    setReports((current) => [{ id: Date.now(), ...report, time: new Date().toLocaleString(), source: 'local' }, ...current]);
     addActivity(`Community report saved on this device · ${report.type}`, 'community');
     void submitCommunityReport(report).then((result) => {
       if (result.synced) {
-        notify('Community report sent to the configured service. Verification status is unavailable.', 'info');
+        notify('Community report stored by the backend. Verification status is unavailable.', 'info');
       } else if (result.status === 'not-configured') {
-        notify('Report saved on this device; community reporting service is not configured.', 'info');
+        notify('Report saved on this device; backend URL is not configured.', 'info');
+      } else if (result.status === 'not-authenticated') {
+        notify('Report saved on this device; sign in to submit it to the backend.', 'info');
       } else {
-        notify('Report saved on this device; community reporting service is unavailable.', 'alert');
+        notify(`Report saved on this device; backend submission failed${result.error ? `: ${result.error}` : '.'}`, 'alert');
       }
     });
   };
@@ -644,7 +739,7 @@ function App() {
     <>
         {!isLanding && <AppShell profile={profile} demoMode={demoMode} setDemoMode={setDemoMode} emergency={emergency} activity={activity} seenActivityIds={seenActivityIds} onModeToggle={() => setDemoMode((mode) => !mode)} />}
       <main className={isLanding ? 'main main--landing' : 'main'}>
-        {!isLanding && <div className={`demo-mode-banner ${demoMode ? '' : 'live-mode-banner'}`}><span className="demo-banner-dot" /><span>{demoMode ? <><b>DEMO MODE</b> · GPS tracking and location results are paused. Browser location permission: {liveLocation.permission}.</> : <><b>LIVE MODE</b> · GPS is requested from this device. Routing, safety scoring, contact delivery, and guardian sync remain prototype-only.</>}</span></div>}
+        {!isLanding && <div className={`demo-mode-banner ${demoMode ? '' : 'live-mode-banner'}`}><span className="demo-banner-dot" /><span>{demoMode ? <><b>DEMO MODE</b> · GPS tracking and location results are paused. Browser location permission: {liveLocation.permission}.</> : <><b>LIVE MODE</b> · GPS is requested from this device. Route guidance and safety scoring remain prototype-only; contact delivery and guardian-device sync are not active.</>}</span></div>}
         {!isLanding && !isOnline && <div className="offline-mode-banner" role="status"><AlertTriangle size={16} /><span><b>OFFLINE MODE</b> · Local profile and journey data remain on this device. {lastKnownLocation ? `Last GPS fix: ${new Date(lastKnownLocation.timestamp).toLocaleString()}. ` : ''}Map lookups and backend services are unavailable; events are not queued or synced automatically.</span></div>}
         <SafetyContext.Provider value={{ location: demoMode ? coordinates : hasRecentLiveFix(location, liveLocation, 20000) ? coordinates : null, demoMode }}>
         <Routes>
@@ -652,24 +747,24 @@ function App() {
           <Route path="/landing" element={<Landing />} />
           <Route path="/onboarding" element={<OnboardingPage onComplete={() => { localStorage.setItem('sahara-onboarding-complete', 'true'); setOnboardingComplete(true); }} />} />
           <Route path="/signup" element={<Navigate to="/profile-setup" replace />} />
-          <Route path="/profile-setup" element={<ProfilePage profile={profile} setProfile={setProfile} contacts={contacts} setContacts={setContacts} notify={notify} />} />
-          <Route path="/profile" element={<ProfilePage profile={profile} setProfile={setProfile} contacts={contacts} setContacts={setContacts} notify={notify} />} />
+          <Route path="/profile-setup" element={<ProfilePage profile={profile} setProfile={setProfile} contacts={contacts} setContacts={setContacts} journey={journey} setJourney={setJourney} backendLocationSharing={backendLocationSharing} setBackendLocationSharing={setBackendLocationSharing} notify={notify} />} />
+          <Route path="/profile" element={<ProfilePage profile={profile} setProfile={setProfile} contacts={contacts} setContacts={setContacts} journey={journey} setJourney={setJourney} backendLocationSharing={backendLocationSharing} setBackendLocationSharing={setBackendLocationSharing} notify={notify} />} />
           <Route path="/home" element={!onboardingComplete ? <Navigate to="/onboarding" replace /> : !profile.name.trim() ? <Navigate to="/profile-setup" replace /> : <Dashboard profile={profile} journey={journey} batteryPct={batteryPct} emergency={emergency} location={location} liveLocation={liveLocation} demoMode={demoMode} contacts={contacts} activity={activity} />} />
           <Route path="/dashboard" element={<Navigate to="/home" replace />} />
           <Route path="/journey" element={<JourneySetup journey={journey} startJourney={startJourney} notify={notify} location={location} liveLocation={liveLocation} demoMode={demoMode} requestLocation={requestLocation} />} />
-          <Route path="/live-journey" element={<LiveJourney journey={journey} batteryPct={batteryPct} location={location} liveLocation={liveLocation} demoMode={demoMode} travelledPath={travelledPath} shareLocation={shareLocation} requestLocation={requestLocation} endJourney={endJourney} recordCheckIn={recordJourneyCheckIn} notify={notify} />} />
+          <Route path="/live-journey" element={<LiveJourney journey={journey} batteryPct={batteryPct} location={location} liveLocation={liveLocation} demoMode={demoMode} travelledPath={travelledPath} shareLocation={shareLocation} backendLocationSharing={backendLocationSharing} requestLocation={requestLocation} endJourney={endJourney} recordCheckIn={recordJourneyCheckIn} notify={notify} />} />
             <Route path="/sos" element={<FunctionalSosPage emergency={emergency} activateEmergency={activateEmergency} beginEmergencySequence={beginEmergencySequence} cancelEmergencySequence={cancelEmergencySequence} activationCountdown={activationCountdown} resolveEmergency={resolveEmergency} countdown={countdown} contacts={contacts} location={location} liveLocation={liveLocation} demoMode={demoMode} shareLocation={shareLocation} notificationLog={notificationLog} alertSoundOn={alertSoundOn} startAlertSound={startAlertSound} stopAlertSound={stopAlertSound} duressPin={duressPin} />} />
           <Route path="/journey-alert" element={<AlertPage journey={journey} emergency={emergency} beginEmergencySequence={beginEmergencySequence} resolveEmergency={resolveEmergency} countdown={countdown} contacts={contacts} location={location} liveLocation={liveLocation} batteryPct={batteryPct} demoMode={demoMode} recordCheckIn={recordJourneyCheckIn} extendJourneyArrival={extendJourneyArrival} />} />
           <Route path="/notifications" element={<NotificationCenter activity={activity} notificationLog={notificationLog} seenActivityIds={seenActivityIds} markAllViewed={() => setSeenActivityIds(activity.map((item) => item.id))} />} />
           <Route path="/history" element={<SafetyHistory activity={activity} />} />
-          <Route path="/privacy" element={<PrivacyCenter profile={profile} contacts={contacts} journey={journey} reports={reports} evidence={evidence} activity={activity} notificationLog={notificationLog} lastKnownLocation={lastKnownLocation} shareLocation={shareLocation} setShareLocation={setShareLocation} onClearData={clearLocalData} notify={notify} />} />
+          <Route path="/privacy" element={<PrivacyCenter profile={profile} contacts={contacts} journey={journey} reports={reports} evidence={evidence} activity={activity} notificationLog={notificationLog} lastKnownLocation={lastKnownLocation} shareLocation={shareLocation} setShareLocation={setShareLocation} backendAuthenticated={isBackendAuthenticated()} backendLocationSharing={backendLocationSharing} setBackendLocationSharing={setBackendLocationSharing} onClearData={clearLocalData} notify={notify} />} />
           <Route path="/voice" element={<VoicePage journey={journey} notify={notify} location={location} liveLocation={liveLocation} contacts={contacts} demoMode={demoMode} profile={profile} requestLocation={requestLocation} recordCheckIn={recordJourneyCheckIn} emergency={emergency} resolveEmergency={resolveEmergency} beginEmergencySequence={beginEmergencySequence} alertSoundOn={alertSoundOn} startAlertSound={startAlertSound} stopAlertSound={stopAlertSound} />} />
           <Route path="/evidence" element={<EvidenceVault evidence={evidence} addEvidence={addEvidence} addEvidenceNote={addEvidenceNote} deleteEvidence={deleteEvidence} downloadEvidence={downloadEvidence} notify={notify} />} />
           <Route path="/nearby-help" element={<NearbyHelp notify={notify} location={location} liveLocation={liveLocation} demoMode={demoMode} requestLocation={requestLocation} />} />
           <Route path="/community-map" element={<CommunityMap reports={reports} addReport={addReport} location={location} liveLocation={liveLocation} demoMode={demoMode} notify={notify} />} />
           <Route path="/battery" element={<BatteryPage batteryPct={batteryPct} batteryTimeRemaining={batteryTimeRemaining} batteryStatus={batteryStatus} batteryError={batteryError} location={location} lastKnownLocation={lastKnownLocation} liveLocation={liveLocation} demoMode={demoMode} shareLocation={shareLocation} notify={notify} />} />
           <Route path="/smartwatch" element={<Smartwatch beginEmergencySequence={beginEmergencySequence} journey={journey} batteryPct={batteryPct} recordCheckIn={recordJourneyCheckIn} notify={notify} />} />
-          <Route path="/guardian" element={<Guardian profile={profile} journey={journey} batteryPct={batteryPct} location={location} liveLocation={liveLocation} demoMode={demoMode} emergency={emergency} contacts={contacts} notificationLog={notificationLog} />} />
+          <Route path="/guardian" element={<Guardian profile={profile} journey={journey} batteryPct={batteryPct} location={location} liveLocation={liveLocation} demoMode={demoMode} emergency={emergency} contacts={contacts} notificationLog={notificationLog} backendLocationSharing={backendLocationSharing} />} />
           <Route path="/settings" element={<SettingsRoute profile={profile} setProfile={setProfile} contacts={contacts} setContacts={setContacts} shareLocation={shareLocation} setShareLocation={setShareLocation} notify={notify} liveLocation={liveLocation} demoMode={demoMode} requestLocation={requestLocation} setDemoMode={setDemoMode} alertSoundOn={alertSoundOn} startAlertSound={startAlertSound} stopAlertSound={stopAlertSound} duressPin={duressPin} setDuressPin={setDuressPin} />} />
           <Route path="*" element={<Navigate to="/landing" replace />} />
         </Routes>
@@ -1040,7 +1135,7 @@ function MapView({ compact = false, places = [], reports = [], location, demoMod
   return <div className={`map-frame ${compact ? 'map-frame--compact' : ''}`}><MapContainer center={center} zoom={compact ? 14 : 15} scrollWheelZoom={!compact} zoomControl={!compact} className="leaflet-map"><MapRecenter center={center} /><TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />{plannedPath.length > 1 && <Polyline positions={plannedPath} pathOptions={{ color: '#e74476', weight: 5, opacity: 0.8, dashArray: '8 7' }} />}{travelledPath.length > 1 && <Polyline positions={travelledPath} pathOptions={{ color: '#4a1238', weight: 5, opacity: 0.9 }} />}{renderedDestination && <CircleMarker center={renderedDestination} radius={8} pathOptions={{ color: '#fff', weight: 3, fillColor: '#d94f7d', fillOpacity: 1 }}><Tooltip>Destination · direct-line preview</Tooltip></CircleMarker>}<CircleMarker center={center} radius={8} pathOptions={{ color: '#fff', weight: 3, fillColor: '#159579', fillOpacity: 1 }}><Tooltip>Current GPS location</Tooltip></CircleMarker>{places.map((place) => <CircleMarker key={place.name} center={place.point} radius={7} pathOptions={{ color: '#fff', weight: 2, fillColor: place.type === 'Safe Zone' ? '#18a689' : place.type === 'Unsafe Area' ? '#ee4774' : '#f59b4c', fillOpacity: 1 }}><Tooltip>{place.name}</Tooltip></CircleMarker>)}{reports.map((report, index) => <Circle key={`${report.id}-${index}`} center={report.point} radius={90} pathOptions={{ color: '#ed4976', fillColor: '#ed4976', fillOpacity: 0.14 }} />)}</MapContainer><span className="map-compass"><Crosshair size={17} /></span></div>;
 }
 
-function LiveJourney({ journey, batteryPct, location, liveLocation, demoMode, travelledPath, shareLocation, requestLocation, endJourney, recordCheckIn, notify }) {
+function LiveJourney({ journey, batteryPct, location, liveLocation, demoMode, travelledPath, shareLocation, backendLocationSharing, requestLocation, endJourney, recordCheckIn, notify }) {
   const navigate = useNavigate();
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -1109,12 +1204,12 @@ function LiveJourney({ journey, batteryPct, location, liveLocation, demoMode, tr
           <div className="live-eta"><Clock3 size={18} /><div><b>{journey.eta || 'Not set'}</b><small>Your expected arrival time · not a live ETA</small></div></div>
           <div className="metric-grid"><div><span>DISTANCE LEFT</span><b>Unavailable</b></div><div><span>DURATION</span><b>{journey.active ? elapsedLabel(journey.startedAt) : 'Not started'}</b></div><div><span>BATTERY</span><b>{batteryPct == null ? 'Unavailable' : `${batteryPct}%`}</b></div></div>
           <div className="journey-location-detail"><MapPin size={16} /><span><b>{coordinates ? `${coordinates[0].toFixed(5)}, ${coordinates[1].toFixed(5)}` : 'Current location unavailable'}</b><small>{demoMode ? 'GPS paused in Demo Mode' : gpsConnected ? `Accuracy ±${Math.round(location.accuracy)} m` : liveLocation.error || 'Waiting for a recent GPS fix'}</small></span></div>
-          {journey.active && <div className="journey-checkin"><span><CheckCircle2 size={16} /><span><b>Manual check-in</b><small>{lastCheckIn} · stored on this device</small></span></span><Button variant="safe" onClick={recordCheckIn}>I’m safe</Button></div>}
+          {journey.active &&           <div className="journey-checkin"><span><CheckCircle2 size={16} /><span><b>Manual check-in</b><small>{lastCheckIn} · {journey.backendJourneyId ? 'also synced to backend when signed in' : 'stored on this device'}</small></span></span><Button variant="safe" onClick={recordCheckIn}>I’m safe</Button></div>}
           {journey.active && <Button variant="outline" onClick={shareCurrentLocation}><Navigation size={16} /> Share current GPS location</Button>}
           {journey.active && !shareLocation && <p className="small-note">Enable manual location-link sharing in Settings before sharing.</p>}
           {journey.active && <Button variant="dark-outline" onClick={() => { endJourney(); navigate('/home'); }}><Check size={16} /> End journey</Button>}
         </Panel>
-        <SafetyInsight>{demoMode ? 'GPS tracking, coordinates, and location results are paused in Demo Mode. Manual check-ins remain available on this device.' : gpsConnected ? 'GPS updates are being recorded on this device. Route guidance, deviation detection, and contact delivery are unavailable without configured services.' : 'Live tracking is waiting for browser location access.'}</SafetyInsight>
+        <SafetyInsight>{demoMode ? 'GPS tracking, coordinates, and location results are paused in Demo Mode. Manual check-ins remain available on this device.' : gpsConnected ? journey.backendJourneyId && backendLocationSharing ? 'GPS is recorded on this device and sent to the backend for route checks because you enabled location sync. No contact delivery occurs.' : 'GPS updates are recorded on this device. Backend location upload is off unless enabled in your profile; route guidance and contact delivery are not active.' : 'Live tracking is waiting for browser location access.'}</SafetyInsight>
         <Link to="/journey-alert" className="missed-link"><Clock3 size={15} /> Check-ins & alerts <ArrowRight size={14} /></Link>
       </div>
     </div>
@@ -1131,8 +1226,8 @@ function SosPage({ emergency, activateEmergency, beginEmergencySequence, cancelE
   const coordinates = location ? `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}` : 'Unavailable';
   const triggeredAt = notificationLog[0]?.time ? new Date(notificationLog[0].time).toLocaleString() : 'Not active';
   return <div className="page-content"><PageHeader eyebrow="HERE WHEN IT MATTERS" title="Emergency support" subtitle="A clear next step when you or someone you care about needs help." />
-    <div className="sos-layout"><Panel className={`sos-panel ${emergency ? 'sos-panel--active' : ''}`}><div className="sos-glow" /><div className="sos-panel-content"><span className="eyebrow">{emergency ? 'ACTIVE EMERGENCY' : 'EMERGENCY RESPONSE · PROTOTYPE'}</span><div className={`emergency-status-mark ${emergency ? 'emergency-status-mark--active' : ''}`}><Siren size={34} /><span>{emergency ? 'SOS ACTIVE' : 'STANDBY'}</span></div><h2>{emergency ? 'Emergency mode is active.' : 'Need help? We’re here.'}</h2><p>{emergency ? 'Contact notifications are simulated on this device. Use call or message links below to contact someone directly.' : 'Start a brief cancellation countdown before the local emergency state activates.'}</p>{emergency && <div className="emergency-summary"><span><MapPin size={14} /> {coordinates} {demoMode && '· demo'}</span><span><Clock3 size={14} /> Activated {triggeredAt}</span><span><Users size={14} /> Trusted circle sharing {shareLocation ? 'enabled locally' : 'paused'}</span></div>}{emergency && <div className="alert-countdown"><span>00:{String(countdown).padStart(2, '0')}</span><small>Emergency state duration</small></div>}{emergency ? <div className="emergency-controls"><Button variant="light" onClick={() => alertSoundOn ? stopAlertSound() : notify('Sound can be enabled during activation')}>{alertSoundOn ? 'Mute alert sound' : 'Alert sound muted'} <Volume2 size={16} /></Button><Button variant="dark-outline" onClick={() => setShowCancelConfirm(true)}>Cancel Emergency <X size={16} /></Button></div> : <Button variant="hot" onClick={() => setShowConfirm(true)}>ACTIVATE EMERGENCY <Siren size={16} /></Button>}</div><div className="sos-footer"><span><LockKeyhole size={14} /> No automatic calls or real contact messages</span><span>{demoMode ? 'GPS PAUSED' : 'DEVICE MODE'}</span></div></Panel>
-      <div className="sos-aside"><Panel className="contact-panel"><SectionTitle title="Your trusted circle" trailing={<Link to="/profile" className="quiet-link">Edit <ArrowRight size={13} /></Link>} />{contacts.map((contact, index) => { const event = notificationLog.find((entry) => entry.contact === contact.name); return <div className="contact-row contact-row--actions" key={`${contact.name}-${index}`}><div className="avatar">{contact.initials || contact.name.slice(0, 1)}</div><span><b>{contact.name}</b><small>{contact.relation} · {event ? 'Notification simulated' : contact.phone || 'No number saved'}</small></span><a href={contact.phone ? `tel:${contact.phone}` : undefined} aria-label={`Call ${contact.name}`} title="Call using your device"><Phone size={15} /></a><a href={contact.phone ? `sms:${contact.phone}` : undefined} aria-label={`Message ${contact.name}`} title="Message using your device"><MessageCircle size={15} /></a></div>; })}</Panel>{emergency && <Panel className="notification-log-panel"><SectionTitle title="Emergency notification log" trailing={<span className="demo-badge">LOCAL PROTOTYPE</span>} />{notificationLog.slice(0, 4).map((entry, index) => <div className="notification-log-row" key={`${entry.contact}-${index}`}><CheckCircle2 size={15} /><span><b>{entry.contact}</b><small>{new Date(entry.time).toLocaleTimeString()} · {entry.coordinates ? entry.coordinates.join(', ') : 'Location unavailable'}</small></span><em>{entry.status}</em></div>)}<p className="small-note">No network notification was sent. Call and SMS links require your explicit action and device support.</p></Panel>}<Panel className="duress-panel"><div className="duress-icon"><ShieldAlert size={19} /></div><div><span className="eyebrow">DURESS PIN · PROTOTYPE</span><h3>A discreet emergency demo.</h3><p>Enter your configured demo PIN to demonstrate a duress state. Do not use a real PIN here.</p><form className="pin-form" onSubmit={checkPin}><input aria-label="Demo PIN" type="password" inputMode="numeric" maxLength="8" value={pin} onChange={(e) => setPin(e.target.value)} placeholder="••••" /><Button variant="dark" type="submit">Check PIN <ArrowRight size={14} /></Button></form>{pinMessage && <small className="form-feedback">{pinMessage}</small>}</div></Panel><div className="feature-note"><LockKeyhole size={16} /><p><b>Honest by design.</b> A browser prototype cannot monitor physical volume buttons or trigger actions from the lock screen.</p></div></div></div>
+    <div className="sos-layout"><Panel className={`sos-panel ${emergency ? 'sos-panel--active' : ''}`}><div className="sos-glow" /><div className="sos-panel-content"><span className="eyebrow">{emergency ? 'ACTIVE EMERGENCY' : 'EMERGENCY RESPONSE · PROTOTYPE'}</span><div className={`emergency-status-mark ${emergency ? 'emergency-status-mark--active' : ''}`}><Siren size={34} /><span>{emergency ? 'SOS ACTIVE' : 'STANDBY'}</span></div><h2>{emergency ? 'Emergency mode is active.' : 'Need help? We’re here.'}</h2><p>{emergency ? 'If signed in, the backend records this SOS and may create in-app notifications for registered users. No SMS, phone call, push notification, or emergency-service contact is sent.' : 'Start a brief cancellation countdown before the local emergency state activates.'}</p>{emergency && <div className="emergency-summary"><span><MapPin size={14} /> {coordinates} {demoMode && '· demo'}</span><span><Clock3 size={14} /> Activated {triggeredAt}</span><span><Users size={14} /> Trusted circle sharing {shareLocation ? 'enabled locally' : 'paused'}</span></div>}{emergency && <div className="alert-countdown"><span>00:{String(countdown).padStart(2, '0')}</span><small>Emergency state duration</small></div>}{emergency ? <div className="emergency-controls"><Button variant="light" onClick={() => alertSoundOn ? stopAlertSound() : notify('Sound can be enabled during activation')}>{alertSoundOn ? 'Mute alert sound' : 'Alert sound muted'} <Volume2 size={16} /></Button><Button variant="dark-outline" onClick={() => setShowCancelConfirm(true)}>Cancel Emergency <X size={16} /></Button></div> : <Button variant="hot" onClick={() => setShowConfirm(true)}>ACTIVATE EMERGENCY <Siren size={16} /></Button>}</div><div className="sos-footer"><span><LockKeyhole size={14} /> No automatic calls or real contact messages</span><span>{demoMode ? 'GPS PAUSED' : 'DEVICE MODE'}</span></div></Panel>
+      <div className="sos-aside"><Panel className="contact-panel"><SectionTitle title="Your trusted circle" trailing={<Link to="/profile" className="quiet-link">Edit <ArrowRight size={13} /></Link>} />{contacts.map((contact, index) => { const event = notificationLog.find((entry) => entry.contact === contact.name); return <div className="contact-row contact-row--actions" key={`${contact.name}-${index}`}><div className="avatar">{contact.initials || contact.name.slice(0, 1)}</div><span><b>{contact.name}</b><small>{contact.relation} · {event ? 'Delivery not confirmed' : contact.phone || 'No number saved'}</small></span><a href={contact.phone ? `tel:${contact.phone}` : undefined} aria-label={`Call ${contact.name}`} title="Call using your device"><Phone size={15} /></a><a href={contact.phone ? `sms:${contact.phone}` : undefined} aria-label={`Message ${contact.name}`} title="Message using your device"><MessageCircle size={15} /></a></div>; })}</Panel>{emergency && <Panel className="notification-log-panel"><SectionTitle title="Emergency notification log" trailing={<span className="demo-badge">LOCAL PROTOTYPE</span>} />{notificationLog.slice(0, 4).map((entry, index) => <div className="notification-log-row" key={`${entry.contact}-${index}`}><CheckCircle2 size={15} /><span><b>{entry.contact}</b><small>{new Date(entry.time).toLocaleTimeString()} · {entry.coordinates ? entry.coordinates.join(', ') : 'Location unavailable'}</small></span><em>{entry.status}</em></div>)}<p className="small-note">No external contact notification was sent. Call and SMS links require your explicit action and device support.</p></Panel>}<Panel className="duress-panel"><div className="duress-icon"><ShieldAlert size={19} /></div><div><span className="eyebrow">DURESS PIN · PROTOTYPE</span><h3>A discreet emergency demo.</h3><p>Enter your configured demo PIN to demonstrate a duress state. Do not use a real PIN here.</p><form className="pin-form" onSubmit={checkPin}><input aria-label="Demo PIN" type="password" inputMode="numeric" maxLength="8" value={pin} onChange={(e) => setPin(e.target.value)} placeholder="••••" /><Button variant="dark" type="submit">Check PIN <ArrowRight size={14} /></Button></form>{pinMessage && <small className="form-feedback">{pinMessage}</small>}</div></Panel><div className="feature-note"><LockKeyhole size={16} /><p><b>Honest by design.</b> A browser prototype cannot monitor physical volume buttons or trigger actions from the lock screen.</p></div></div></div>
     {showConfirm && <Modal title={activationCountdown == null ? 'Emergency activation' : 'Emergency activation'} onClose={() => { if (activationCountdown != null) cancelEmergencySequence(); setShowConfirm(false); }}><p className="modal-copy">{activationCountdown == null ? 'Confirm to begin a three-second cancellation window. The alert beep will play on this device after you confirm.' : 'Emergency activates when the countdown ends. Cancel now if this was accidental.'}</p>{activationCountdown != null ? <div className="activation-countdown"><strong>{activationCountdown}</strong><span>Cancel before activation</span><Button variant="outline" onClick={() => { cancelEmergencySequence(); setShowConfirm(false); }}>Cancel activation</Button></div> : <><div className="modal-contact-list">{contacts.slice(0, 3).map((contact) => <span key={contact.name}><CheckCircle2 size={15} /> {contact.name} · notification simulated only</span>)}</div><div className="modal-actions"><Button variant="outline" onClick={() => setShowConfirm(false)}>Not now</Button><Button variant="hot" onClick={beginEmergencySequence}>Start countdown <Siren size={15} /></Button></div></>}</Modal>}
     {showCancelConfirm && <Modal title="Cancel emergency mode?" onClose={() => setShowCancelConfirm(false)}><p className="modal-copy">This only clears the local prototype emergency state. If you are in danger, contact local emergency services directly.</p><div className="modal-actions"><Button variant="outline" onClick={() => setShowCancelConfirm(false)}>Keep active</Button><Button variant="hot" onClick={() => { resolveEmergency(); setShowCancelConfirm(false); }}>Cancel Emergency <X size={15} /></Button></div></Modal>}
   </div>;
@@ -1202,7 +1297,7 @@ function NotificationCenter({ activity, notificationLog, seenActivityIds, markAl
         }) : <div className="empty-activity"><Bell size={22} /><b>No safety updates yet.</b><p>Journey starts, check-ins, and emergency events will appear here.</p></div>}
       </Panel>
       <div className="notification-aside">
-        <Panel><SectionTitle title="Delivery status" /><p className="panel-subtitle">Prototype — service not connected. Items here are local records; background push alerts and trusted-contact delivery are not active.</p><Link to="/settings" className="button button--outline button--full">Review permissions <ArrowRight size={15} /></Link></Panel>
+        <Panel><SectionTitle title="Delivery status" /><p className="panel-subtitle">This screen shows local records. The backend may store an SOS record for a signed-in user, but background push alerts and confirmed trusted-contact delivery are not active.</p><Link to="/settings" className="button button--outline button--full">Review permissions <ArrowRight size={15} /></Link></Panel>
         <Link to="/history" className="missed-link"><Clock3 size={15} /> View safety history <ArrowRight size={14} /></Link>
       </div>
     </div>
@@ -1236,7 +1331,7 @@ function SafetyHistory({ activity }) {
   </div>;
 }
 
-function PrivacyCenter({ profile, contacts, journey, reports, evidence, activity, notificationLog, lastKnownLocation, shareLocation, setShareLocation, onClearData, notify }) {
+function PrivacyCenter({ profile, contacts, journey, reports, evidence, activity, notificationLog, lastKnownLocation, shareLocation, setShareLocation, backendAuthenticated, backendLocationSharing, setBackendLocationSharing, onClearData, notify }) {
   const [confirmClear, setConfirmClear] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState(typeof Notification === 'undefined' ? 'unavailable' : Notification.permission);
   const [microphoneStatus, setMicrophoneStatus] = useState('Not requested');
@@ -1297,14 +1392,14 @@ function PrivacyCenter({ profile, contacts, journey, reports, evidence, activity
     <PageHeader eyebrow="YOUR DATA, YOUR CONTROL" title="Privacy center" subtitle="Review what this browser stores, export a copy, or clear local SAHARA data." />
     <div className="privacy-center-grid">
       <div className="privacy-center-main">
-        <Panel className="privacy-data-panel"><SectionTitle title="Stored on this device" /><p className="panel-subtitle">Profile details, contacts, journeys, reports, and event metadata are saved in local browser storage. Evidence attachment files are stored separately in IndexedDB. No account sync is configured.</p>
-          <div className="privacy-data-list"><div><span>Profile</span><b>{profile.name ? 'Set up' : 'Not set up'}</b></div><div><span>Trusted contacts</span><b>{contacts.length}</b></div><div><span>Journey</span><b>{journey.active ? 'Active locally' : 'No active journey'}</b></div><div><span>Community reports</span><b>{reports.length}</b></div><div><span>Evidence records</span><b>{evidence.length}</b></div><div><span>Safety activity</span><b>{activity.length + notificationLog.length}</b></div><div><span>Last GPS fix</span><b>{lastKnownLocation ? new Date(lastKnownLocation.timestamp).toLocaleString() : 'Not recorded'}</b></div></div>
+        <Panel className="privacy-data-panel"><SectionTitle title="Stored on this device" /><p className="panel-subtitle">This browser keeps your profile, contacts, journeys, reports, and event metadata; evidence attachments are stored separately in IndexedDB. {backendAuthenticated ? 'Supported profile, contact, community, journey, check-in, and SOS records also sync to your signed-in backend account. GPS coordinates sync only when you explicitly enable live journey location sharing.' : 'Supported records sync to a backend account only after you sign in. Live GPS coordinates stay in this browser unless you enable sharing.'}</p>
+          <div className="privacy-data-list"><div><span>Profile</span><b>{profile.name ? 'Set up' : 'Not set up'}</b></div><div><span>Trusted contacts</span><b>{contacts.length}</b></div><div><span>Journey</span><b>{journey.active ? journey.backendJourneyId ? 'Active · backend linked' : 'Active locally' : 'No active journey'}</b></div><div><span>Community reports</span><b>{reports.length}</b></div><div><span>Evidence records</span><b>{evidence.length}</b></div><div><span>Safety activity</span><b>{activity.length + notificationLog.length}</b></div><div><span>Last GPS fix</span><b>{lastKnownLocation ? new Date(lastKnownLocation.timestamp).toLocaleString() : 'Not recorded'}</b></div></div>
         </Panel>
-        <Panel className="privacy-actions-panel"><SectionTitle title="Your data actions" /><div className="privacy-action-row"><span><b>Export local data</b><small>Downloads profile, notes, contacts, journey, and event metadata as JSON. Attached media files are not included.</small></span><Button variant="outline" onClick={exportData}><FileText size={15} /> Download</Button></div><div className="privacy-action-row privacy-action-row--danger"><span><b>Clear local data</b><small>Removes SAHARA profile, contacts, reports, evidence, and event history from this browser.</small></span><Button variant="hot" onClick={() => setConfirmClear(true)}><X size={15} /> Clear data</Button></div></Panel>
+        <Panel className="privacy-actions-panel"><SectionTitle title="Your data actions" /><div className="privacy-action-row"><span><b>Export local data</b><small>Downloads profile, notes, contacts, journey, and event metadata as JSON. Attached media files are not included.</small></span><Button variant="outline" onClick={exportData}><FileText size={15} /> Download</Button></div><div className="privacy-action-row privacy-action-row--danger"><span><b>Clear local data</b><small>Removes SAHARA profile, contacts, reports, evidence, and event history from this browser. Backend account records are not deleted.</small></span><Button variant="hot" onClick={() => setConfirmClear(true)}><X size={15} /> Clear data</Button></div></Panel>
       </div>
-      <div className="privacy-center-aside"><Panel><div className="privacy-icon"><LockKeyhole size={19} /></div><h3>Sharing requires your action</h3><p>GPS access is requested from this device. Location links are shared only when you explicitly choose a share action. Backend alerts, cloud sync, and guardian-device access are not configured.</p><SafetyInsight>Browser storage is not encrypted by this prototype. Avoid storing sensitive evidence on a shared or untrusted device.</SafetyInsight></Panel><Panel><SectionTitle title="Permissions & sharing" /><label className="settings-row"><span className="settings-copy"><b>Allow manual location-link sharing</b><small>{shareLocation ? 'Enabled; location links still require your explicit action.' : 'Disabled; location-link actions are blocked.'}</small></span><input type="checkbox" checked={shareLocation} onChange={(event) => setShareLocation(event.target.checked)} /><span className="switch" /></label><div className="permission-row"><span className="settings-icon"><Bell size={17} /></span><span><b>Notifications</b><small>Permission: {notificationPermission}</small></span><Button variant="outline" onClick={requestNotificationPermission} disabled={notificationPermission === 'granted'}>{notificationPermission === 'granted' ? 'Enabled' : 'Request'}</Button></div><div className="permission-row"><span className="settings-icon"><Mic size={17} /></span><span><b>Microphone</b><small>{microphoneStatus}</small></span><Button variant="outline" onClick={() => { void requestMediaPermission('audio'); }}>Check access</Button></div><div className="permission-row"><span className="settings-icon"><Smartphone size={17} /></span><span><b>Camera</b><small>{cameraStatus}</small></span><Button variant="outline" onClick={() => { void requestMediaPermission('video'); }}>Check access</Button></div><Link to="/settings" className="button button--outline button--full">Review settings <Settings size={15} /></Link></Panel></div>
+      <div className="privacy-center-aside"><Panel><div className="privacy-icon"><LockKeyhole size={19} /></div><h3>Sharing requires your action</h3><p>GPS access is requested from this device. Location links require your explicit action. Signed-in backend synchronization is enabled only for supported records; live GPS upload is a separate opt-in. SOS records do not place calls or send SMS.</p><SafetyInsight>Browser storage is not encrypted by this prototype. Avoid storing sensitive evidence on a shared or untrusted device.</SafetyInsight></Panel><Panel><SectionTitle title="Permissions & sharing" /><label className="settings-row"><span className="settings-copy"><b>Allow manual location-link sharing</b><small>{shareLocation ? 'Enabled; location links still require your explicit action.' : 'Disabled; location-link actions are blocked.'}</small></span><input type="checkbox" checked={shareLocation} onChange={(event) => setShareLocation(event.target.checked)} /><span className="switch" /></label><label className="settings-row"><span className="settings-copy"><b>Sync live journey location to backend</b><small>{backendLocationSharing ? 'Enabled for signed-in active journeys.' : 'Off by default. Enable only if you want GPS coordinates saved to your account during active journeys.'}</small></span><input type="checkbox" checked={backendLocationSharing} onChange={(event) => setBackendLocationSharing(event.target.checked)} /><span className="switch" /></label><div className="permission-row"><span className="settings-icon"><Bell size={17} /></span><span><b>Notifications</b><small>Permission: {notificationPermission}</small></span><Button variant="outline" onClick={requestNotificationPermission} disabled={notificationPermission === 'granted'}>{notificationPermission === 'granted' ? 'Enabled' : 'Request'}</Button></div><div className="permission-row"><span className="settings-icon"><Mic size={17} /></span><span><b>Microphone</b><small>{microphoneStatus}</small></span><Button variant="outline" onClick={() => { void requestMediaPermission('audio'); }}>Check access</Button></div><div className="permission-row"><span className="settings-icon"><Smartphone size={17} /></span><span><b>Camera</b><small>{cameraStatus}</small></span><Button variant="outline" onClick={() => { void requestMediaPermission('video'); }}>Check access</Button></div><Link to="/settings" className="button button--outline button--full">Review settings <Settings size={15} /></Link></Panel></div>
     </div>
-    {confirmClear && <Modal title="Clear SAHARA data from this browser?" onClose={() => setConfirmClear(false)}><p className="modal-copy">This removes your saved profile, contacts, reports, evidence, and local event history. This action cannot be undone. It does not change browser permission settings.</p><div className="modal-actions"><Button variant="outline" onClick={() => setConfirmClear(false)}>Keep my data</Button><Button variant="hot" onClick={() => { onClearData(); setConfirmClear(false); }}>Clear local data</Button></div></Modal>}
+    {confirmClear && <Modal title="Clear SAHARA data from this browser?" onClose={() => setConfirmClear(false)}><p className="modal-copy">This removes your saved profile, contacts, reports, evidence, and local event history. It signs out of the backend but does not delete records already stored in your backend account. This action cannot be undone and does not change browser permission settings.</p><div className="modal-actions"><Button variant="outline" onClick={() => setConfirmClear(false)}>Keep my data</Button><Button variant="hot" onClick={() => { onClearData(); setConfirmClear(false); }}>Clear local data</Button></div></Modal>}
   </div>;
 }
 
@@ -1639,9 +1734,37 @@ function CommunityMap({ reports, addReport, location, liveLocation, demoMode, no
   const [reportType, setReportType] = useState('Poor lighting');
   const [note, setNote] = useState('');
   const [showForm, setShowForm] = useState(false);
-  const filtered = reports.filter((report) => filter === 'All' || report.type === filter);
+  const [backendReports, setBackendReports] = useState([]);
+  const [feedMessage, setFeedMessage] = useState('');
+  const [feedStatus, setFeedStatus] = useState('loading');
+  const [feedRetry, setFeedRetry] = useState(0);
+  const allReports = [...reports, ...backendReports];
+  const filtered = allReports.filter((report) => filter === 'All' || report.type === filter);
   const mapReports = filtered.filter((report) => Number.isFinite(report.point?.[0]) && Number.isFinite(report.point?.[1]));
   const hasRecentFix = hasRecentLiveFix(location, liveLocation);
+  useEffect(() => {
+    let active = true;
+    setFeedStatus('loading');
+    void listCommunityReports().then((result) => {
+      if (!active) return;
+      if (result.synced) {
+        setBackendReports(result.data);
+        setFeedMessage('');
+        setFeedStatus('loaded');
+      } else {
+        setFeedMessage(result.status === 'not-configured'
+          ? 'Shared reports are unavailable because the backend URL is not configured.'
+          : `Shared reports could not be loaded${result.error ? `: ${result.error}` : '.'}`);
+        setFeedStatus('unavailable');
+      }
+    }).catch((error) => {
+      if (active) {
+        setFeedMessage(`Shared reports could not be loaded${error instanceof Error ? `: ${error.message}` : '.'}`);
+        setFeedStatus('unavailable');
+      }
+    });
+    return () => { active = false; };
+  }, [feedRetry]);
   const submit = (event) => {
     event.preventDefault();
     if (demoMode || !hasRecentFix) {
@@ -1658,7 +1781,7 @@ function CommunityMap({ reports, addReport, location, liveLocation, demoMode, no
       <PageHeader
         eyebrow="LOOK OUT FOR EACH OTHER"
         title="Community safety map"
-        subtitle="Reports are unverified and stored on this device. Prototype — service not connected; there is no shared community feed."
+        subtitle="Reports are user-submitted and unverified. This view combines reports saved on this device with the public backend feed when available."
         action={<Button variant="hot" onClick={() => setShowForm(true)}><Plus size={16} /> Submit a report</Button>}
       />
       <div className="community-layout">
@@ -1674,14 +1797,17 @@ function CommunityMap({ reports, addReport, location, liveLocation, demoMode, no
         <div className="community-side">
           <Panel className="report-list-panel">
             <SectionTitle title="Recent community notes" trailing={<span className="demo-badge">UNVERIFIED</span>} />
-            {reports.length
-              ? reports.slice(0, 5).map((report) => (
+            {feedMessage && <p className="small-note" role="status">{feedMessage} <button className="quiet-link" type="button" onClick={() => setFeedRetry((attempt) => attempt + 1)}>Try again</button></p>}
+            {allReports.length
+              ? allReports.slice(0, 5).map((report) => (
                 <div className="report-item" key={report.id}>
                   <span className="report-icon"><AlertTriangle size={16} /></span>
-                  <div><b>{report.type}</b><small>{report.note}</small><span>{report.time}</span></div>
+                  <div><b>{report.type}</b><small>{report.note}</small><span>{report.time} · {report.source === 'backend' ? 'Backend feed' : 'This device'}</span></div>
                 </div>
               ))
-              : <div className="empty-reports"><div className="report-illustration"><MapPin size={22} /></div><b>No community reports saved.</b><p>Reports from other users are unavailable. Prototype — service not connected.</p></div>}
+              : feedStatus === 'loading'
+                ? <p className="small-note" role="status">Loading reports saved on this device and the shared backend feed…</p>
+                : <div className="empty-reports"><div className="report-illustration"><MapPin size={22} /></div><b>No community reports are available.</b><p>Reports submitted here or in the backend feed will appear when available.</p></div>}
           </Panel>
           <SafetyInsight>Community reports are user-submitted and unverified. They are not emergency alerts or confirmed safety information.</SafetyInsight>
         </div>
@@ -1691,7 +1817,9 @@ function CommunityMap({ reports, addReport, location, liveLocation, demoMode, no
           <form className="report-form" onSubmit={submit}>
             <label className="field-label">REPORT TYPE<select value={reportType} onChange={(e) => setReportType(e.target.value)}>{['Unsafe Area', 'Poor lighting', 'Harassment', 'Suspicious activity', 'Safe area'].map((item) => <option key={item}>{item}</option>)}</select></label>
             <label className="field-label">WHAT WOULD YOU LIKE OTHERS TO KNOW?<textarea rows="4" maxLength="240" placeholder="Keep it factual. Please don't include personal details." value={note} onChange={(e) => setNote(e.target.value)} /></label>
-            <p className="privacy-caption"><LockKeyhole size={14} /> {demoMode || !location ? 'Switch to Live Mode and allow GPS to attach a real report location.' : 'Your name and contact details are not included in the local report.'}</p>
+            <p className="privacy-caption"><LockKeyhole size={14} /> {demoMode || !location
+              ? 'Switch to Live Mode and allow GPS to attach a real report location.'
+              : 'If you are signed in and the backend is available, the report note and exact location are shared in its public feed. Your name and contact details are not included.'}</p>
             <div className="modal-actions">
               <Button variant="outline" type="button" onClick={() => setShowForm(false)}>Cancel</Button>
               <Button variant="hot" type="submit">Save report <ArrowRight size={15} /></Button>
@@ -1796,7 +1924,7 @@ function Smartwatch({ journey, batteryPct, recordCheckIn, notify }) {
   </div>;
 }
 
-function Guardian({ profile, journey, batteryPct, location, liveLocation, demoMode, emergency, contacts, notificationLog }) {
+function Guardian({ profile, journey, batteryPct, location, liveLocation, demoMode, emergency, contacts, notificationLog, backendLocationSharing }) {
   const firstName = profile.name.trim().split(/\s+/)[0] || 'Your';
   const hasRecentFix = hasRecentLiveFix(location, liveLocation);
   const coordinates = demoMode ? location ? [location.latitude, location.longitude] : null
@@ -1823,7 +1951,7 @@ function Guardian({ profile, journey, batteryPct, location, liveLocation, demoMo
         subtitle={`This view reflects browser state for ${profile.name || 'this profile'}. It does not sync to another device or account.`}
         action={<span className={`mode-chip ${gpsConnected ? 'is-live' : 'is-demo'}`}><span />{gpsConnected ? 'LIVE ON THIS DEVICE' : demoMode ? 'GPS PAUSED' : 'GPS UNAVAILABLE'}</span>}
       />
-      <div className="guardian-sync-note"><Activity size={15} /><span><b>Prototype — service not connected.</b> Location and safety events are not being sent to a guardian device.</span></div>
+      <div className="guardian-sync-note"><Activity size={15} /><span><b>Guardian-device sync is not active.</b> This dashboard shows browser state; opted-in location sharing stores coordinates in the signed-in account but does not send them to a guardian device.</span></div>
       <div className="guardian-dashboard">
         <aside className="guardian-side">
           <div className="guardian-brand"><Shield size={17} /> SAHARA AI <small>GUARDIAN</small></div>
@@ -1869,8 +1997,8 @@ function Guardian({ profile, journey, batteryPct, location, liveLocation, demoMo
             <Link to="/evidence" className="button button--outline"><LockKeyhole size={15} /> Evidence</Link>
             {emergency && <Link to="/notifications" className="button button--outline"><Bell size={15} /> Emergency log</Link>}
           </div>
-          {journey.active && <p className="small-note">Journey updates and check-ins are local to this browser. The line on the map is a direct-line preview, not route guidance.</p>}
-          {emergency && notificationLog.length > 0 && <p className="small-note">Prototype — service not connected. Contact delivery status: {notificationLog.find((entry) => entry.contact)?.status || 'Not confirmed'}.</p>}
+          {journey.active && <p className="small-note">{journey.backendJourneyId && backendLocationSharing ? 'This account syncs journey locations to the backend; they are not shared with another device or guardian automatically.' : journey.backendJourneyId ? 'Journey record is on the backend; live location sync is off.' : 'Journey updates and check-ins are local to this browser.'} The line on the map is a direct-line preview, not route guidance.</p>}
+          {emergency && notificationLog.length > 0 && <p className="small-note">SOS record status: {notificationLog.find((entry) => entry.contact)?.status || 'Not confirmed'}. A backend record is not an external alert.</p>}
         </div>
       </div>
     </div>
@@ -1878,23 +2006,115 @@ function Guardian({ profile, journey, batteryPct, location, liveLocation, demoMo
 }
 function GuardianIcon({ name }) { const Icon = ({ 'Live tracking': Navigation, 'Journey history': Clock3, Alerts: Bell, Contacts: Users, Evidence: LockKeyhole, Settings })[name] || CircleHelp; return <Icon size={16} />; }
 
-function ProfilePage({ profile, setProfile, contacts, setContacts, notify }) {
+function ProfilePage({ profile, setProfile, contacts, setContacts, journey, setJourney, backendLocationSharing, setBackendLocationSharing, notify }) {
   const [draft, setDraft] = useState(profile);
+  const [backendAuthenticated, setBackendAuthenticated] = useState(isBackendAuthenticated);
+  const [accountMode, setAccountMode] = useState('login');
+  const [accountEmail, setAccountEmail] = useState(profile.email || '');
+  const [accountPassword, setAccountPassword] = useState('');
   const navigate = useNavigate();
   const pageLocation = useLocation();
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
   const [newRelation, setNewRelation] = useState('Friend');
+  const [editingContactIndex, setEditingContactIndex] = useState(null);
+  const unlinkBackendRecords = () => {
+    setBackendLocationSharing(false);
+    setJourney((current) => ({ ...current, backendJourneyId: undefined }));
+    setContacts((current) => current.map(({ backendContactId, ...contact }) => ({
+      ...contact,
+      status: 'On this device',
+    })));
+  };
+  useEffect(() => {
+    if (!backendAuthenticated) return undefined;
+    let active = true;
+    void Promise.all([loadBackendProfile(), listTrustedContacts()]).then(async ([profileResult, contactsResult]) => {
+      if (!active) return;
+      if (profileResult.status === 'not-authenticated' || contactsResult.status === 'not-authenticated') {
+        await logoutBackendAccount();
+        if (active) {
+          unlinkBackendRecords();
+          setBackendAuthenticated(false);
+          notify('Backend session expired. Sign in again to sync your data.', 'alert');
+        }
+        return;
+      }
+      if (profileResult.synced) {
+        const remoteProfile = fromBackendProfile(profileResult.data);
+        setProfile((current) => ({ ...current, ...remoteProfile, emergency: current.emergency }));
+        setDraft((current) => ({ ...current, ...remoteProfile, emergency: current.emergency }));
+      } else {
+        notify(`Backend profile could not be loaded${profileResult.error ? `: ${profileResult.error}` : '.'}`, 'alert');
+      }
+      if (contactsResult.synced) {
+        const remoteContacts = contactsResult.data.map((contact) => ({
+          name: contact.name,
+          phone: contact.phone,
+          relation: contact.relationship,
+          initials: contact.name[0] || '?',
+          backendContactId: contact.id,
+          email: contact.email,
+          priority: contact.priority,
+          is_active: contact.is_active,
+          status: 'Synced to backend; not notified',
+        }));
+        setContacts((current) => [
+          ...remoteContacts,
+          ...current.filter((contact) => !remoteContacts.some((remote) => remote.name.toLowerCase() === contact.name.toLowerCase()
+            && remote.phone.replace(/\s+/g, '') === contact.phone.replace(/\s+/g, ''))),
+        ]);
+      } else {
+        notify(`Backend contacts could not be loaded${contactsResult.error ? `: ${contactsResult.error}` : '.'}`, 'alert');
+      }
+    }).catch((error) => {
+      if (active) notify(`Backend account data could not be loaded${error instanceof Error ? `: ${error.message}` : '.'}`, 'alert');
+    });
+    return () => { active = false; };
+  }, [backendAuthenticated]);
+  const authenticateAccount = async (event) => {
+    event.preventDefault();
+    if (accountMode === 'signup' && !draft.name.trim()) {
+      notify('Enter your full name in the profile form before creating an account.', 'alert');
+      return;
+    }
+    const credentials = {
+      email: accountEmail.trim(),
+      password: accountPassword,
+      ...(accountMode === 'signup' ? { name: draft.name.trim(), phone: draft.phone || null } : {}),
+    };
+    const result = await authenticateBackendAccount(accountMode, credentials);
+    if (!result.synced) {
+      notify(result.error || 'Backend account service is unavailable.', 'alert');
+      return;
+    }
+    const user = result.data.user;
+    const nextProfile = { ...draft, name: user.name, email: user.email };
+    setDraft(nextProfile);
+    setProfile((current) => ({ ...current, name: user.name, email: user.email }));
+    setBackendAuthenticated(true);
+    setAccountPassword('');
+    notify(accountMode === 'signup' ? 'Backend account created and signed in.' : 'Signed in to the backend account.');
+  };
+  const logoutAccount = async () => {
+    const result = await logoutBackendAccount();
+    unlinkBackendRecords();
+    setBackendAuthenticated(false);
+    notify(result.synced ? 'Signed out of the backend account.' : 'Backend session cleared in this tab; server logout could not be confirmed.', result.synced ? 'success' : 'alert');
+  };
   const saveProfileForm = (event) => {
     event.preventDefault();
     setProfile(draft);
-    void saveProfile(draft).then((result) => {
-      notify(result.synced
-        ? 'Your profile was sent to the configured service.'
-        : result.status === 'not-configured'
-          ? 'Your profile is saved on this device; cloud sync is not configured.'
-          : 'Your profile is saved on this device; cloud sync is unavailable.', result.synced ? 'success' : 'info');
-    });
+    if (backendAuthenticated) {
+      void saveProfile(draft).then((result) => {
+        notify(result.synced
+          ? 'Profile saved on this device and backend.'
+          : `Profile saved on this device; backend update failed${result.error ? `: ${result.error}` : '.'}`,
+        result.synced ? 'success' : 'alert');
+      });
+    } else {
+      notify('Profile saved on this device. Sign in to sync it with the backend.', 'info');
+    }
     if (pageLocation.pathname === '/profile-setup') navigate('/home');
   };
   const addContact = (event) => {
@@ -1902,19 +2122,128 @@ function ProfilePage({ profile, setProfile, contacts, setContacts, notify }) {
     const name = newName.trim();
     const phone = newPhone.trim();
     if (!name) return;
-    if (contacts.some((contact) => contact.name.trim().toLowerCase() === name.toLowerCase()
+    if (contacts.some((contact, index) => index !== editingContactIndex
+      && contact.name.trim().toLowerCase() === name.toLowerCase()
       && contact.phone.replace(/\s+/g, '') === phone.replace(/\s+/g, ''))) {
       notify('That contact is already saved on this device.', 'alert');
       return;
     }
-    setContacts((items) => [...items, { name, phone, relation: newRelation, status: 'On this device', initials: name[0] }]);
+    const currentContact = editingContactIndex === null ? null : contacts[editingContactIndex];
+    const contact = {
+      ...currentContact,
+      name,
+      phone,
+      relation: newRelation,
+      status: 'On this device',
+      initials: name[0],
+    };
+    const contactIndex = editingContactIndex;
+    if (contactIndex !== null) {
+      setContacts((items) => items.map((item, index) => index === contactIndex ? contact : item));
+      if (backendAuthenticated && phone) {
+        const saveRequest = currentContact?.backendContactId
+          ? updateTrustedContact(currentContact.backendContactId, contact)
+          : createTrustedContact(contact);
+        void saveRequest.then((result) => {
+          if (result.synced) {
+            setContacts((items) => items.map((item, index) => index === contactIndex
+              ? { ...item, backendContactId: result.data.id || currentContact?.backendContactId, status: 'Synced to backend; not notified' }
+              : item));
+            notify('Trusted contact updated locally and on the backend. They were not notified.', 'info');
+          } else {
+            setContacts((items) => items.map((item, index) => index === contactIndex
+              ? { ...item, status: 'Local edit; backend update failed' }
+              : item));
+            notify(`Contact updated on this device; backend update failed${result.error ? `: ${result.error}` : '.'}`, 'alert');
+          }
+        });
+      } else {
+        notify('Trusted contact updated on this device. Sign in with a phone number to sync it; they were not notified.', 'info');
+      }
+    } else {
+      setContacts((items) => [...items, contact]);
+      if (backendAuthenticated && phone) {
+        void createTrustedContact(contact).then((result) => {
+          if (result.synced) {
+            setContacts((items) => items.map((item) => item.name === name && item.phone === phone
+              ? { ...item, backendContactId: result.data.id, status: 'Synced to backend; not notified' }
+              : item));
+            notify('Trusted contact saved locally and on the backend. They were not notified.', 'info');
+          } else {
+            notify(`Trusted contact remains on this device; backend sync failed${result.error ? `: ${result.error}` : '.'}`, 'alert');
+          }
+        });
+      } else {
+        notify(backendAuthenticated
+          ? 'Trusted contact saved on this device; a phone number is required for backend sync. They were not notified.'
+          : 'Trusted contact saved on this device. Sign in to sync it; they were not notified.', 'info');
+      }
+    }
     setNewName('');
     setNewPhone('');
-    notify('Trusted contact saved on this device. They were not notified.', 'info');
+    setNewRelation('Friend');
+    setEditingContactIndex(null);
+  };
+  const editContact = (contact, index) => {
+    setEditingContactIndex(index);
+    setNewName(contact.name);
+    setNewPhone(contact.phone);
+    setNewRelation(contact.relation || 'Friend');
+  };
+  const cancelContactEdit = () => {
+    setEditingContactIndex(null);
+    setNewName('');
+    setNewPhone('');
+    setNewRelation('Friend');
+  };
+  const removeContact = (contact, index) => {
+    setContacts((items) => items.filter((_, itemIndex) => itemIndex !== index));
+    if (contact.backendContactId && backendAuthenticated) {
+      void deleteTrustedContact(contact.backendContactId).then((result) => {
+        notify(result.synced
+          ? 'Trusted contact removed from this device and backend.'
+          : 'Contact removed from this device; backend removal could not be confirmed.',
+        result.synced ? 'success' : 'alert');
+      });
+    } else {
+      notify('Contact removed from this device.');
+    }
   };
   return (
     <div className="page-content">
       <PageHeader eyebrow="YOUR DETAILS, YOUR CHOICE" title="Your profile" subtitle="Set up your details and the people you want close by." action={<Link to="/settings" className="button button--outline"><Settings size={16} /> Settings</Link>} />
+      <Panel className="profile-form-panel backend-account-panel">
+        <SectionTitle title="Backend account" trailing={<span className="demo-badge">{backendAuthenticated ? 'SIGNED IN' : 'LOCAL ONLY'}</span>} />
+        {backendAuthenticated ? (
+          <>
+            <div className="profile-form-footer">
+              <p className="panel-subtitle">Signed in as {profile.email || accountEmail}. Profile, contacts with phone numbers, community reports, journeys, check-ins, and manually triggered SOS records can sync to the backend. Emergency delivery is not enabled.</p>
+              <Button variant="outline" type="button" onClick={logoutAccount}>Sign out</Button>
+            </div>
+            <label className="settings-row">
+              <span className="settings-copy"><b>Sync live journey location to backend</b><small>{backendLocationSharing ? 'Enabled for signed-in active journeys. Previously stored backend locations are retained.' : 'Off. GPS coordinates stay in this browser unless you enable this setting.'}</small></span>
+              <input type="checkbox" checked={backendLocationSharing} onChange={(event) => setBackendLocationSharing(event.target.checked)} />
+              <span className="switch" />
+            </label>
+          </>
+        ) : (
+          <>
+            <p className="panel-subtitle">Sign in or create a backend account to sync supported records. Your existing local profile and contacts remain available without an account.</p>
+            <form className="profile-form" onSubmit={authenticateAccount}>
+              <div className="form-grid">
+                <label className="field-label">ACCOUNT EMAIL<input type="email" autoComplete="email" value={accountEmail} onChange={(event) => setAccountEmail(event.target.value)} required /></label>
+                <label className="field-label">PASSWORD<input type="password" autoComplete={accountMode === 'signup' ? 'new-password' : 'current-password'} minLength={accountMode === 'signup' ? 8 : 1} value={accountPassword} onChange={(event) => setAccountPassword(event.target.value)} required /></label>
+              </div>
+              <div className="profile-form-footer">
+                <Button variant="dark" type="submit">{accountMode === 'signup' ? 'Create backend account' : 'Sign in to backend'}</Button>
+                <button className="quiet-link" type="button" onClick={() => setAccountMode((mode) => mode === 'signup' ? 'login' : 'signup')}>
+                  {accountMode === 'signup' ? 'I already have an account' : 'Create an account'}
+                </button>
+              </div>
+            </form>
+          </>
+        )}
+      </Panel>
       <div className="profile-layout">
         <Panel className="profile-form-panel">
           <div className="profile-avatar-row">
@@ -1933,7 +2262,7 @@ function ProfilePage({ profile, setProfile, contacts, setContacts, notify }) {
               <label className="field-label field-span">HOME LOCATION<input value={draft.home} onChange={(e) => setDraft({ ...draft, home: e.target.value })} /></label>
             </div>
             <div className="profile-form-footer">
-              <span><LockKeyhole size={14} /> Stored on this device unless a backend is configured.</span>
+              <span><LockKeyhole size={14} /> {backendAuthenticated ? 'Saved on this device and synced when supported.' : 'Stored on this device until you sign in.'}</span>
               <Button variant="hot" type="submit">Save profile <Check size={16} /></Button>
             </div>
           </form>
@@ -1941,8 +2270,8 @@ function ProfilePage({ profile, setProfile, contacts, setContacts, notify }) {
         <div className="contacts-column">
           <Panel className="contacts-panel">
             <SectionTitle title="Trusted contacts" trailing={<span className="demo-badge">{contacts.length} CONTACTS</span>} />
-            <p className="panel-subtitle">Choose people who can support you during a safety event. Prototype — service not connected; saving a contact does not notify them.</p>
-            {contacts.length === 0 && <p className="small-note">No trusted contacts saved yet. Add people you know and trust. Emergency messages are not sent unless a backend service is configured.</p>}
+            <p className="panel-subtitle">Choose people who can support you during a safety event. Signed-in accounts can sync contacts with phone numbers; saving a contact does not notify them.</p>
+            {contacts.length === 0 && <p className="small-note">No trusted contacts saved yet. Add people you know and trust. Emergency messages are not sent automatically; SOS records do not send SMS or place calls.</p>}
             {contacts.map((contact, index) => (
               <div className="trusted-contact" key={`${contact.name}-${index}`}>
                 <div className="avatar">{contact.initials || contact.name[0]}</div>
@@ -1954,18 +2283,20 @@ function ProfilePage({ profile, setProfile, contacts, setContacts, notify }) {
                   {contact.phone
                     ? <a href={`sms:${contact.phone.replace(/[^\d+]/g, '')}`} aria-label={`Message ${contact.name}`} title="Open a message using your device"><MessageCircle size={14} /></a>
                     : <button className="icon-button" type="button" disabled aria-label={`Message ${contact.name}`} title="No phone number saved"><MessageCircle size={14} /></button>}
-                  <button className="icon-button" aria-label={`Remove ${contact.name}`} onClick={() => { setContacts((items) => items.filter((_, itemIndex) => itemIndex !== index)); notify('Contact removed'); }}><X size={14} /></button>
+                  <button className="icon-button" type="button" aria-label={`Edit ${contact.name}`} onClick={() => editContact(contact, index)}><Pencil size={14} /></button>
+                  <button className="icon-button" type="button" aria-label={`Remove ${contact.name}`} onClick={() => removeContact(contact, index)}><X size={14} /></button>
                 </div>
               </div>
             ))}
             <form className="add-contact-form" onSubmit={addContact}>
               <input aria-label="Contact name" placeholder="Contact name" autoComplete="name" value={newName} onChange={(e) => setNewName(e.target.value)} required />
-              <input aria-label="Contact phone number" type="tel" autoComplete="tel" placeholder="Phone number (optional)" value={newPhone} onChange={(e) => setNewPhone(e.target.value)} />
+              <input aria-label="Contact phone number" type="tel" autoComplete="tel" placeholder="Phone number (optional)" value={newPhone} onChange={(e) => setNewPhone(e.target.value)} required={editingContactIndex !== null && Boolean(contacts[editingContactIndex]?.backendContactId)} />
               <label className="sr-only" htmlFor="contact-relation">Relationship</label><select id="contact-relation" aria-label="Relationship" value={newRelation} onChange={(e) => setNewRelation(e.target.value)}>{['Mother', 'Father', 'Sister', 'Brother', 'Partner', 'Friend', 'Other'].map((item) => <option key={item}>{item}</option>)}</select>
-              <Button variant="dark" type="submit"><Plus size={15} /> Add contact</Button>
+              <Button variant="dark" type="submit">{editingContactIndex === null ? <><Plus size={15} /> Add contact</> : <><Check size={15} /> Save contact</>}</Button>
+              {editingContactIndex !== null && <Button variant="outline" type="button" onClick={cancelContactEdit}>Cancel</Button>}
             </form>
           </Panel>
-          <SafetyInsight>Contacts are stored locally. SOS and journey alerts require a configured backend; call and message links open your device app only when you choose them.</SafetyInsight>
+          <SafetyInsight>Contacts remain available locally and sync only when signed in. SOS and journey records may sync to the backend, but emergency contact delivery is not enabled; call and message links open your device app only when you choose them.</SafetyInsight>
         </div>
       </div>
     </div>
@@ -2011,7 +2342,7 @@ function SettingsPage({ profile, contacts, shareLocation, setShareLocation, noti
             <label className="settings-row"><span className="settings-copy"><b>Allow manual location-link sharing</b><small>{shareLocation ? 'Enabled on this device; sharing still requires your action.' : 'Disabled; location-link actions are blocked.'}</small></span><input type="checkbox" checked={shareLocation} onChange={(event) => setShareLocation(event.target.checked)} /><span className="switch" /></label>
           </Panel>
           <Panel className="settings-panel"><SectionTitle title="Your safety tools" />{tools.map(([Icon, title, detail, to]) => <Link className="settings-row settings-tool-link" to={to} key={title}><span className="settings-icon"><Icon size={17} /></span><span className="settings-copy"><b>{title}</b><small>{detail}</small></span><ArrowRight size={15} /></Link>)}</Panel>
-          <Panel className="settings-panel"><SectionTitle title="Privacy & sharing" /><div className="privacy-block"><div className="privacy-icon"><LockKeyhole size={19} /></div><div><h3>Your location stays yours.</h3><p>Location links are shared only when you explicitly choose a share action. This prototype does not send location to trusted contacts or guardian devices in the background.</p></div></div><div className="privacy-points"><span><Check size={14} /> Evidence stored on this device</span><span><Check size={14} /> You control your contacts</span><span><Check size={14} /> No guardian device sync</span></div><Link to="/privacy" className="quiet-link">Open Privacy Center <ArrowRight size={14} /></Link></Panel>
+          <Panel className="settings-panel"><SectionTitle title="Privacy & sharing" /><div className="privacy-block"><div className="privacy-icon"><LockKeyhole size={19} /></div><div><h3>Your location stays yours.</h3><p>Manual location links require your action. Live GPS uploads are separately opt-in in your profile and saved to your backend account during active journeys; they are not automatically sent to contacts or guardian devices.</p></div></div><div className="privacy-points"><span><Check size={14} /> Evidence stored on this device</span><span><Check size={14} /> You control your contacts</span><span><Check size={14} /> No guardian device sync</span></div><Link to="/privacy" className="quiet-link">Open Privacy Center <ArrowRight size={14} /></Link></Panel>
         </div>
         <div className="settings-aside">
           <Panel className="settings-profile-card"><div className="avatar avatar--large">{profile.name.slice(0, 1) || '?'}</div><span className="eyebrow">YOUR ACCOUNT</span><h3>{profile.name || 'Complete your profile'}</h3><p>{profile.email || 'Profile is saved on this device.'}</p><Link to="/profile" className="button button--outline button--full">Edit profile <ArrowRight size={15} /></Link></Panel>

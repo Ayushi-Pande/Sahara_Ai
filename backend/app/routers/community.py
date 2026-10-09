@@ -3,7 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import BatteryStatus, CommunityReport, Journey, LocationUpdate, SafetyAlert, TrustedContact, User, utcnow
+from app.models import BatteryStatus, CommunityReport, Journey, LocationUpdate, SafetyAlert, SafetyScore, TrustedContact, User, utcnow
 from app.schemas import CommunityInput
 from app.services.safety import SafetyScoreService, check_missed_arrival, distance_meters
 from app.utils.auth import current_user
@@ -89,19 +89,27 @@ def nearby_help(latitude: float = Query(ge=-90, le=90), longitude: float = Query
 
 @router.get("/api/analytics/dashboard", summary="Return aggregated safety analytics")
 def analytics_dashboard(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    total_journeys = db.query(Journey).count()
-    completed_journeys = db.query(Journey).filter(Journey.status == "COMPLETED").count()
-    active_journeys = db.query(Journey).filter(Journey.status == "ACTIVE").count()
-    total_alerts = db.query(SafetyAlert).count()
-    sos_incidents = db.query(SafetyAlert).filter(SafetyAlert.alert_type == "SOS").count()
+    total_journeys = db.query(Journey).filter(Journey.user_id == user.id).count()
+    completed_journeys = db.query(Journey).filter(Journey.user_id == user.id, Journey.status == "COMPLETED").count()
+    active_journeys = db.query(Journey).filter(Journey.user_id == user.id, Journey.status == "ACTIVE").count()
+    total_alerts = db.query(SafetyAlert).filter(SafetyAlert.user_id == user.id).count()
+    sos_incidents = db.query(SafetyAlert).filter(SafetyAlert.user_id == user.id, SafetyAlert.alert_type == "SOS").count()
     average_safety_score = 0
-    scores = db.scalars(select(SafetyScore.score)).all()
+    scores = db.scalars(select(SafetyScore.score).where(SafetyScore.user_id == user.id)).all()
     if scores:
         average_safety_score = round(sum(scores) / len(scores), 2)
-    battery_alerts = db.query(SafetyAlert).filter(SafetyAlert.alert_type.in_(["BATTERY_LOW", "BATTERY_CRITICAL"])) .count()
-    route_deviations = db.query(SafetyAlert).filter(SafetyAlert.alert_type == "ROUTE_DEVIATION").count()
-    missed_checkins = db.query(SafetyAlert).filter(SafetyAlert.alert_type == "MISSED_CHECKIN").count()
-    offline_events = db.query(SafetyAlert).filter(SafetyAlert.alert_type == "DEVICE_OFFLINE").count()
+    battery_alerts = db.query(SafetyAlert).filter(
+        SafetyAlert.user_id == user.id, SafetyAlert.alert_type.in_(["BATTERY_LOW", "BATTERY_CRITICAL"])
+    ).count()
+    route_deviations = db.query(SafetyAlert).filter(
+        SafetyAlert.user_id == user.id, SafetyAlert.alert_type == "ROUTE_DEVIATION"
+    ).count()
+    missed_checkins = db.query(SafetyAlert).filter(
+        SafetyAlert.user_id == user.id, SafetyAlert.alert_type == "MISSED_CHECKIN"
+    ).count()
+    offline_events = db.query(SafetyAlert).filter(
+        SafetyAlert.user_id == user.id, SafetyAlert.alert_type == "DEVICE_OFFLINE"
+    ).count()
     return success({
         "total_journeys": total_journeys,
         "completed_journeys": completed_journeys,

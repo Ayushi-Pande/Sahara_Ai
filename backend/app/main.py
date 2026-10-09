@@ -1,17 +1,28 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.database import Base, SessionLocal, engine, settings, supabase_configured
+from app.database import (
+    Base,
+    SessionLocal,
+    engine,
+    is_supabase_database_url,
+    settings,
+    verify_database_connection,
+)
 from app.models import Journey
 from app.routers import auth, community, core, emergency, evidence
 from app.services.safety import check_missed_arrival
+
+logger = logging.getLogger(__name__)
 
 
 async def arrival_monitor():
@@ -24,8 +35,9 @@ async def arrival_monitor():
                 changed = check_missed_arrival(db, journey) or changed
             if changed:
                 db.commit()
-        except Exception:
+        except Exception as error:
             db.rollback()
+            logger.warning("Arrival monitor iteration failed; database session was rolled back (%s).", type(error).__name__)
         finally:
             db.close()
         await asyncio.sleep(60)
@@ -33,7 +45,9 @@ async def arrival_monitor():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    verify_database_connection(engine)
+    if engine.dialect.name == "sqlite":
+        Base.metadata.create_all(bind=engine)
     task = asyncio.create_task(arrival_monitor())
     yield
     task.cancel()
@@ -48,9 +62,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+allowed_origins = [origin.strip().rstrip("/") for origin in settings.frontend_url.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url.rstrip("/")],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
@@ -78,18 +93,26 @@ async def validation_error_handler(_: Request, exc: RequestValidationError):
 
 @app.get("/health", tags=["Health"], summary="Check API service status")
 def health():
+    try:
+        verify_database_connection(engine)
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503, detail="Database is unavailable.")
     return {"status": "ok", "service": "SAHARA AI Backend", "version": "2.0.0"}
 
 
 @app.get("/api/system/status", tags=["System"], summary="Read deployment and environment health")
 def system_status():
+    try:
+        verify_database_connection(engine)
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503, detail="Database is unavailable.")
     return {
         "success": True,
         "data": {
             "database": "ok",
-            "supabase": "configured" if supabase_configured() else "demo",
-            "storage": "ok",
-            "realtime": "enabled" if supabase_configured() else "demo",
+            "supabase": "connected" if is_supabase_database_url(settings.database_url) else "not-integrated",
+            "storage": "local",
+            "realtime": "not-integrated",
             "environment": "production" if settings.secret_key != "replace-this-development-secret" else "development",
             "background_monitor": "running",
             "version": "2.0.0",

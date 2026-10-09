@@ -1,6 +1,6 @@
-from datetime import timezone
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -184,7 +184,7 @@ def end_journey(journey_id: int, db: Session = Depends(get_db), user: User = Dep
 
 @router.post("/api/journeys/{journey_id}/location", status_code=201, tags=["Locations"], summary="Store a live location update")
 def add_location(journey_id: int, payload: LocationInput, db: Session = Depends(get_db), user: User = Depends(current_user)):
-    journey = owned_journey(db, journey_id, user)
+    owned_journey(db, journey_id, user)
     location = LocationUpdate(user_id=user.id, journey_id=journey_id, **payload.model_dump(exclude={"timestamp"}), timestamp=payload.timestamp or utcnow())
     db.add(location)
     if payload.battery is not None:
@@ -240,6 +240,15 @@ def list_devices(db: Session = Depends(get_db), user: User = Depends(current_use
     return success([device_data(device) for device in devices])
 
 
+@router.get("/api/devices/status", tags=["Devices"], summary="Get device connection health")
+def device_status(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    devices = db.scalars(select(Device).where(Device.user_id == user.id)).all()
+    statuses = {}
+    for device in devices:
+        statuses[device.device_id] = device_status_for(device.last_seen)
+    return success({"devices": statuses, "summary": {"online": sum(1 for v in statuses.values() if v == "ONLINE"), "stale": sum(1 for v in statuses.values() if v == "STALE"), "offline": sum(1 for v in statuses.values() if v == "OFFLINE")}})
+
+
 @router.get("/api/devices/{device_id}", tags=["Devices"], summary="Get a registered device")
 def get_device(device_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
     device = db.get(Device, device_id)
@@ -256,15 +265,6 @@ def delete_device(device_id: int, db: Session = Depends(get_db), user: User = De
     db.delete(device)
     db.commit()
     return success({"deleted": True})
-
-
-@router.get("/api/devices/status", tags=["Devices"], summary="Get device connection health")
-def device_status(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    devices = db.scalars(select(Device).where(Device.user_id == user.id)).all()
-    statuses = {}
-    for device in devices:
-        statuses[device.device_id] = device_status_for(device.last_seen)
-    return success({"devices": statuses, "summary": {"online": sum(1 for v in statuses.values() if v == "ONLINE"), "stale": sum(1 for v in statuses.values() if v == "STALE"), "offline": sum(1 for v in statuses.values() if v == "OFFLINE")}})
 
 
 @router.get("/api/journeys/{journey_id}/locations", tags=["Locations"], summary="Get journey location history")
